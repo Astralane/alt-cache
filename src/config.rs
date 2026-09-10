@@ -1,0 +1,129 @@
+use anyhow::{Result, ensure};
+use serde::Deserialize;
+use std::{net::SocketAddr, path::PathBuf};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub http_addr: SocketAddr,
+    pub grpc_addr: SocketAddr,
+    pub sources: Vec<Source>,
+    #[serde(default = "stale_seconds")]
+    pub stale_after_secs: u64,
+    #[serde(default = "reconcile_seconds")]
+    pub reconcile_after_secs: u64,
+    #[serde(default = "capacity")]
+    pub stream_capacity: usize,
+    #[serde(default)]
+    pub logging: Logging,
+    pub alert_webhook_env: Option<String>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    pub name: String,
+    pub grpc_url_env: String,
+    pub token_env: Option<String>,
+    pub rpc_url_env: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logging {
+    #[serde(default)]
+    pub stdout: Stdout,
+    #[serde(default)]
+    pub file: File,
+}
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Stdout {
+    pub enabled: bool,
+    pub level: String,
+    pub enable_ansi: bool,
+}
+impl Default for Stdout {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "info".into(),
+            enable_ansi: true,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct File {
+    pub enabled: bool,
+    pub level: String,
+    pub max_days: usize,
+    pub dir: PathBuf,
+}
+impl Default for File {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: "info".into(),
+            max_days: 30,
+            dir: "logs".into(),
+        }
+    }
+}
+fn stale_seconds() -> u64 {
+    15
+}
+fn reconcile_seconds() -> u64 {
+    3600
+}
+fn capacity() -> usize {
+    4096
+}
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.sources.is_empty(), "at least one source is required");
+        ensure!(self.stream_capacity > 0, "stream_capacity must be positive");
+        ensure!(
+            self.stale_after_secs > 0,
+            "stale_after_secs must be positive"
+        );
+        ensure!(
+            self.reconcile_after_secs > self.stale_after_secs,
+            "reconcile interval must exceed stale interval"
+        );
+        ensure!(self.logging.file.max_days > 0, "max_days must be positive");
+        let mut names = std::collections::HashSet::new();
+        for source in &self.sources {
+            ensure!(names.insert(&source.name), "source names must be unique");
+            secret(&source.grpc_url_env)?;
+            secret(&source.rpc_url_env)?;
+            if let Some(name) = &source.token_env {
+                secret(name)?;
+            }
+        }
+        if let Some(name) = &self.alert_webhook_env {
+            secret(name)?;
+        }
+        Ok(())
+    }
+}
+pub fn secret(name: &str) -> Result<String> {
+    let value =
+        std::env::var(name).map_err(|_| anyhow::anyhow!("missing environment variable {name}"))?;
+    ensure!(!value.is_empty(), "empty environment variable {name}");
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn example_config_parses() {
+        let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(c.sources.len(), 2);
+        assert_eq!(c.stream_capacity, 4096);
+    }
+    #[test]
+    fn unknown_config_is_rejected() {
+        let text = format!("unexpected = 1\n{}", include_str!("../config.example.toml"));
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+}

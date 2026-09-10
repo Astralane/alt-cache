@@ -1,0 +1,29 @@
+http_addr = "127.0.0.1:8090"
+grpc_addr = "127.0.0.1:8091"
+stale_after_secs = 15
+reconcile_after_secs = 3600
+stream_capacity = 4096
+# alert_webhook_env = "ALT_CACHE_ALERT_WEBHOOK"
+
+[[sources]]
+name = "primary"
+grpc_url_env = "ALT_PRIMARY_GRPC_URL"
+rpc_url_env = "ALT_PRIMARY_RPC_URL"
+token_env = "ALT_PRIMARY_TOKEN"
+
+[[sources]]
+name = "secondary"
+grpc_url_env = "ALT_SECONDARY_GRPC_URL"
+rpc_url_env = "ALT_SECONDARY_RPC_URL"
+token_env = "ALT_SECONDARY_TOKEN"
+
+[logging.stdout]
+enabled = true
+level = "info"
+enable_ansi = true
+
+[logging.file]
+enabled = true
+level = "info"
+dir = "/var/log/alt-cache"
+max_days = 30

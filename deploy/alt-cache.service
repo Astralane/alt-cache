@@ -1,0 +1,23 @@
+[Unit]
+Description=Astralane ALT cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=alt-cache
+Group=alt-cache
+WorkingDirectory=/opt/alt-cache
+EnvironmentFile=/etc/alt-cache/env
+ExecStart=/opt/alt-cache/astralane-alt-cache /etc/alt-cache/config.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+LogsDirectory=alt-cache
+ReadWritePaths=/var/log/alt-cache
+
+[Install]
+WantedBy=multi-user.target
