@@ -1,11 +1,5 @@
 use anyhow::Result;
-use astralane_alt_cache::{
-    api,
-    config::{Config, secret},
-    logging,
-    store::Store,
-    updater, yellowstone,
-};
+use astralane_alt_cache::{api, config::Config, logging, store::Store, updater, yellowstone};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     future::Future,
@@ -26,13 +20,19 @@ fn main() -> Result<()> {
     let config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
     config.validate()?;
     let _guards = logging::init(&config.logging)?;
-    logging::init_alerts(
-        config
-            .alert_webhook_env
-            .as_deref()
-            .map(secret)
-            .transpose()?,
-    )?;
+    let slack_webhook = config
+        .alerts
+        .slack
+        .as_ref()
+        .map(|webhook| webhook.resolve_url("Slack webhook URL"))
+        .transpose()?;
+    let discord_webhook = config
+        .alerts
+        .discord
+        .as_ref()
+        .map(|webhook| webhook.resolve_url("Discord webhook URL"))
+        .transpose()?;
+    logging::init_alerts(slack_webhook, discord_webhook)?;
     install_panic_hook();
 
     let config = Arc::new(config);

@@ -45,9 +45,12 @@ so the owner subscription also reports closures. A full refresh runs once per
 
 ## Run
 
-Copy `config.example.toml` to a private `config.toml`. Set the named environment
-variables. Remove `token_env` for endpoints without a token. Do not put secrets
-in repository files.
+Copy `config.example.toml` to a private `config.toml`. A bootstrap RPC or gRPC
+source accepts either `url` or `url_env`. A gRPC source accepts either `token`
+or `token_env`, and both token fields may be omitted when authentication is not
+required. Do not specify a direct value and its `_env` alternative together.
+Treat a config containing direct tokens or credential-bearing URLs as a secret;
+do not commit it.
 
 ```sh
 cargo test --locked
@@ -132,10 +135,12 @@ client is paging.
   compact text.
   Files use daily rotating JSON. Settings match the
   relay's `logging.stdout` and `logging.file` layout.
-- Optional Slack-compatible webhook. Delivery uses a bounded queue, five-second
-  request timeout, and a one-minute rate limit. Alerts are best effort. Logs
-  remain the source of truth. The gRPC base URL identifies its source in health,
-  logs, and alerts; authentication tokens and transport errors are not logged.
+- Optional native Slack and Discord webhooks. Each can use `url` or `url_env`.
+  Delivery uses one bounded queue, a five-second request timeout, and a
+  one-minute rate limit. Alerts are sent to every configured destination and
+  remain best effort. Logs remain the source of truth. The gRPC base URL
+  identifies its source in health, logs, and alerts; authentication tokens and
+  transport errors are not logged.
 - SIGTERM/SIGINT cancels the services and stops the process. Data is in memory
   only; every restart performs recovery.
 - A permanent service returning unexpectedly is unrecoverable and terminates

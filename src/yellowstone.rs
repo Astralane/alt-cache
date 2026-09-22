@@ -1,7 +1,4 @@
-use crate::{
-    config::{GrpcSource, secret},
-    store::program_id,
-};
+use crate::{config::GrpcSource, store::program_id};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::{collections::HashMap, time::Duration};
@@ -38,7 +35,7 @@ pub async fn run(
     events: mpsc::Sender<Event>,
     stop: CancellationToken,
 ) {
-    let source_url = secret(&source.url_env).expect("gRPC source URL was validated");
+    let source_url = source.resolve_url().expect("gRPC source URL was validated");
     loop {
         let result = tokio::select! {
             _ = stop.cancelled() => break,
@@ -79,7 +76,7 @@ async fn session(
     idle_timeout_secs: u64,
     events: &mpsc::Sender<Event>,
 ) -> Result<()> {
-    let token = source.token_env.as_deref().map(secret).transpose()?;
+    let token = source.resolve_token()?;
     let mut grpc = connect(source_url, token.as_deref()).await?;
     let (requests, receiver) = mpsc::channel(8);
     requests.send(subscribe_request()).await?;

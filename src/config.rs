@@ -16,19 +16,71 @@ pub struct Config {
     pub stream_capacity: usize,
     #[serde(default)]
     pub logging: Logging,
-    pub alert_webhook_env: Option<String>,
+    #[serde(default)]
+    pub alerts: Alerts,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapRpc {
-    pub url_env: String,
+    pub url: Option<String>,
+    pub url_env: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcSource {
-    pub url_env: String,
+    pub url: Option<String>,
+    pub url_env: Option<String>,
+    pub token: Option<String>,
     pub token_env: Option<String>,
+}
+
+impl BootstrapRpc {
+    pub fn resolve_url(&self) -> Result<String> {
+        resolve_required(
+            "bootstrap RPC URL",
+            self.url.as_deref(),
+            self.url_env.as_deref(),
+        )
+    }
+}
+
+impl GrpcSource {
+    pub fn resolve_url(&self) -> Result<String> {
+        resolve_required(
+            "gRPC source URL",
+            self.url.as_deref(),
+            self.url_env.as_deref(),
+        )
+    }
+
+    pub fn resolve_token(&self) -> Result<Option<String>> {
+        resolve_optional(
+            "gRPC source token",
+            self.token.as_deref(),
+            self.token_env.as_deref(),
+        )
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alerts {
+    pub slack: Option<WebhookConfig>,
+    pub discord: Option<WebhookConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub url: Option<String>,
+    pub url_env: Option<String>,
+}
+
+impl WebhookConfig {
+    pub fn resolve_url(&self, name: &str) -> Result<String> {
+        resolve_required(name, self.url.as_deref(), self.url_env.as_deref())
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,21 +149,54 @@ impl Config {
             "full_refresh_interval_secs must be positive"
         );
         ensure!(self.logging.file.max_days > 0, "max_days must be positive");
-        secret(&self.bootstrap_rpc.url_env)?;
+        self.bootstrap_rpc.resolve_url()?;
         let mut urls = std::collections::HashSet::new();
         for source in &self.grpc_sources {
             ensure!(
-                urls.insert(secret(&source.url_env)?),
+                urls.insert(source.resolve_url()?),
                 "gRPC source URLs must be unique"
             );
-            if let Some(name) = &source.token_env {
-                secret(name)?;
-            }
+            source.resolve_token()?;
         }
-        if let Some(name) = &self.alert_webhook_env {
-            secret(name)?;
+        if let Some(webhook) = &self.alerts.slack {
+            webhook.resolve_url("Slack webhook URL")?;
+        }
+        if let Some(webhook) = &self.alerts.discord {
+            webhook.resolve_url("Discord webhook URL")?;
         }
         Ok(())
+    }
+}
+
+fn resolve_required(label: &str, direct: Option<&str>, env: Option<&str>) -> Result<String> {
+    match (direct, env) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "{label} must use either a direct value or an environment variable, not both"
+        ),
+        (Some(value), None) => {
+            ensure!(!value.is_empty(), "{label} must not be empty");
+            Ok(value.to_owned())
+        }
+        (None, Some(name)) => secret(name),
+        (None, None) => anyhow::bail!("{label} is required"),
+    }
+}
+
+fn resolve_optional(
+    label: &str,
+    direct: Option<&str>,
+    env: Option<&str>,
+) -> Result<Option<String>> {
+    match (direct, env) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "{label} must use either a direct value or an environment variable, not both"
+        ),
+        (Some(value), None) => {
+            ensure!(!value.is_empty(), "{label} must not be empty");
+            Ok(Some(value.to_owned()))
+        }
+        (None, Some(name)) => secret(name).map(Some),
+        (None, None) => Ok(None),
     }
 }
 pub fn secret(name: &str) -> Result<String> {
@@ -127,9 +212,40 @@ mod tests {
     #[test]
     fn example_config_parses() {
         let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
-        assert_eq!(c.bootstrap_rpc.url_env, "ALT_BOOTSTRAP_RPC_URL");
+        assert_eq!(
+            c.bootstrap_rpc.url_env.as_deref(),
+            Some("ALT_BOOTSTRAP_RPC_URL")
+        );
         assert_eq!(c.grpc_sources.len(), 2);
         assert_eq!(c.stream_capacity, 4096);
+    }
+
+    #[test]
+    fn direct_source_values_are_supported() {
+        let source: GrpcSource = toml::from_str(
+            r#"
+                url = "https://yellowstone.example.com"
+                token = "token"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            source.resolve_url().unwrap(),
+            "https://yellowstone.example.com"
+        );
+        assert_eq!(source.resolve_token().unwrap().as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn mixed_direct_and_environment_values_are_rejected() {
+        let source: GrpcSource = toml::from_str(
+            r#"
+                url = "https://yellowstone.example.com"
+                url_env = "YELLOWSTONE_URL"
+            "#,
+        )
+        .unwrap();
+        assert!(source.resolve_url().is_err());
     }
     #[test]
     fn unknown_config_is_rejected() {

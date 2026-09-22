@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, secret},
+    config::Config,
     logging,
     store::{Account, Key, KeyedUiAccount, StateUpdater, Store, parse_key, program_id},
     yellowstone::Event,
@@ -148,11 +148,11 @@ pub async fn run(
     mut events: mpsc::Receiver<Event>,
     stop: CancellationToken,
 ) -> Result<()> {
-    let bootstrap_rpc_url = secret(&config.bootstrap_rpc.url_env)?;
+    let bootstrap_rpc_url = config.bootstrap_rpc.resolve_url()?;
     let sources: Vec<_> = config
         .grpc_sources
         .iter()
-        .map(|source| secret(&source.url_env))
+        .map(|source| source.resolve_url())
         .collect::<Result<_>>()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))

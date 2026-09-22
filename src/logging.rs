@@ -52,8 +52,44 @@ pub fn init(config: &Logging) -> Result<Vec<WorkerGuard>> {
 
 static ALERTS: OnceLock<Option<SyncSender<String>>> = OnceLock::new();
 
-pub fn init_alerts(webhook: Option<String>) -> Result<()> {
-    let sender = if let Some(webhook) = webhook {
+enum AlertTarget {
+    Slack(String),
+    Discord(String),
+}
+
+impl AlertTarget {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Slack(_) => "slack",
+            Self::Discord(_) => "discord",
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Self::Slack(url) | Self::Discord(url) => url,
+        }
+    }
+
+    fn payload(&self, text: &str) -> serde_json::Value {
+        match self {
+            Self::Slack(_) => serde_json::json!({"text": text}),
+            Self::Discord(_) => serde_json::json!({"content": text}),
+        }
+    }
+}
+
+pub fn init_alerts(slack: Option<String>, discord: Option<String>) -> Result<()> {
+    let mut targets = Vec::new();
+    if let Some(url) = slack {
+        targets.push(AlertTarget::Slack(url));
+    }
+    if let Some(url) = discord {
+        targets.push(AlertTarget::Discord(url));
+    }
+    let sender = if targets.is_empty() {
+        None
+    } else {
         let (sender, receiver) = sync_channel::<String>(32);
         std::thread::Builder::new()
             .name("alt-alerts".into())
@@ -74,22 +110,22 @@ pub fn init_alerts(webhook: Option<String>) -> Result<()> {
                         continue;
                     }
                     last = Some(std::time::Instant::now());
-                    let sent = runtime.block_on(async {
-                        client
-                            .post(&webhook)
-                            .json(&serde_json::json!({"text":text}))
-                            .send()
-                            .await?
-                            .error_for_status()
-                    });
-                    if sent.is_err() {
-                        tracing::warn!("alert delivery failed");
+                    for target in &targets {
+                        let sent = runtime.block_on(async {
+                            client
+                                .post(target.url())
+                                .json(&target.payload(&text))
+                                .send()
+                                .await?
+                                .error_for_status()
+                        });
+                        if sent.is_err() {
+                            tracing::warn!(target = target.name(), "alert delivery failed");
+                        }
                     }
                 }
             })?;
         Some(sender)
-    } else {
-        None
     };
     ensure!(ALERTS.set(sender).is_ok(), "alerts already initialized");
     Ok(())
@@ -101,5 +137,22 @@ pub fn alert(text: impl Into<String>) {
     };
     if sender.try_send(text.into()).is_err() {
         tracing::warn!("alert queue full");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alert_targets_use_native_payloads() {
+        assert_eq!(
+            AlertTarget::Slack(String::new()).payload("message"),
+            serde_json::json!({"text": "message"})
+        );
+        assert_eq!(
+            AlertTarget::Discord(String::new()).payload("message"),
+            serde_json::json!({"content": "message"})
+        );
     }
 }

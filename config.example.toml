@@ -2,18 +2,25 @@ http_addr = "127.0.0.1:8090"
 yellowstone_idle_timeout_secs = 15
 full_refresh_interval_secs = 3600
 stream_capacity = 4096
-# alert_webhook_env = "ALT_CACHE_ALERT_WEBHOOK"
+
+# [alerts.slack]
+# url_env = "ALT_CACHE_SLACK_WEBHOOK"
+
+# [alerts.discord]
+# url_env = "ALT_CACHE_DISCORD_WEBHOOK"
 
 [bootstrap_rpc]
+# Use exactly one of url or url_env.
 url_env = "ALT_BOOTSTRAP_RPC_URL"
 
 [[grpc_sources]]
+# Each source uses exactly one of url or url_env and at most one of token or token_env.
 url_env = "ALT_PRIMARY_GRPC_URL"
 token_env = "ALT_PRIMARY_TOKEN"
 
 [[grpc_sources]]
-url_env = "ALT_SECONDARY_GRPC_URL"
-token_env = "ALT_SECONDARY_TOKEN"
+url = "https://yellowstone-secondary.example.com"
+token = "replace-with-private-token"
 
 [logging.stdout]
 enabled = true
