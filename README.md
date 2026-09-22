@@ -130,6 +130,8 @@ client is paging.
 ## Operations
 
 - `getHealth`: reports readiness and the active source.
+- The bootstrap completion log reports accumulated response size, fetch time,
+  JSON deserialization time, ALT account decoding time, and total snapshot time.
 - Each Yellowstone source, the state updater, and each inbound network service
   has one named OS thread and one current-thread async runtime. Stdout uses
   compact text.
@@ -139,8 +141,8 @@ client is paging.
   Delivery uses one bounded queue, a five-second request timeout, and a
   one-minute rate limit. Alerts are sent to every configured destination and
   remain best effort. Logs remain the source of truth. The gRPC base URL
-  identifies its source in health, logs, and alerts; authentication tokens and
-  transport errors are not logged.
+  identifies its source in health, logs, and alerts. Failure details are logged,
+  but authentication tokens and credential-bearing RPC URLs are not.
 - SIGTERM/SIGINT cancels the services and stops the process. Data is in memory
   only; every restart performs recovery.
 - A permanent service returning unexpectedly is unrecoverable and terminates

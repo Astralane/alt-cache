@@ -41,8 +41,12 @@ pub async fn run(
             _ = stop.cancelled() => break,
             result = session(source_id, &source, &source_url, idle_timeout_secs, &events) => result,
         };
-        if result.is_err() {
-            tracing::warn!(source = source_url, "Yellowstone source disconnected");
+        if let Err(error) = result {
+            tracing::warn!(
+                source = source_url,
+                error = %format!("{error:#}"),
+                "Yellowstone source disconnected"
+            );
             if events
                 .send(Event::Disconnected { source: source_id })
                 .await

@@ -11,7 +11,7 @@ use solana_address_lookup_table_interface::program;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -31,24 +31,46 @@ struct JsonRpcError {
     message: String,
 }
 
+struct RpcResult<T> {
+    value: T,
+    response_bytes: usize,
+    fetch_duration: Duration,
+    deserialize_duration: Duration,
+}
+
 async fn rpc<T: DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: impl Serialize,
-) -> Result<T> {
-    let reply: JsonRpcResponse<T> = client
+) -> Result<RpcResult<T>> {
+    let fetch_started = Instant::now();
+    let response = client
         .post(url)
         .json(&json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .await
+        .map_err(redact_rpc_error)?
+        .error_for_status()
+        .map_err(redact_rpc_error)?;
+    let body = response.bytes().await.map_err(redact_rpc_error)?;
+    let fetch_duration = fetch_started.elapsed();
+    let deserialize_started = Instant::now();
+    let reply: JsonRpcResponse<T> = serde_json::from_slice(&body)?;
+    let deserialize_duration = deserialize_started.elapsed();
     if let Some(error) = reply.error {
         anyhow::bail!("RPC error {}: {}", error.code, error.message);
     }
-    reply.result.context("RPC result missing")
+    Ok(RpcResult {
+        value: reply.result.context("RPC result missing")?,
+        response_bytes: body.len(),
+        fetch_duration,
+        deserialize_duration,
+    })
+}
+
+fn redact_rpc_error(error: reqwest::Error) -> anyhow::Error {
+    anyhow::Error::new(error.without_url())
 }
 
 #[derive(Deserialize)]
@@ -84,11 +106,20 @@ async fn bootstrap(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(u64, BTreeMap<Key, Arc<Account>>)> {
+    let bootstrap_started = Instant::now();
     let mut bootstrap_slot = None;
     let mut cursor: Option<String> = None;
     let mut seen = HashSet::new();
     let mut accounts = BTreeMap::new();
+    let mut page_number = 0_u64;
+    let mut fetched_accounts = 0_usize;
+    let mut skipped_accounts = 0_usize;
+    let mut response_bytes = 0_u64;
+    let mut fetch_duration = Duration::ZERO;
+    let mut json_deserialize_duration = Duration::ZERO;
+    let mut account_decode_duration = Duration::ZERO;
     loop {
+        page_number += 1;
         let config = ProgramAccountsConfig {
             commitment: "confirmed",
             encoding: "base64+zstd",
@@ -96,13 +127,17 @@ async fn bootstrap(
             limit: PAGE_SIZE,
             pagination_key: cursor.as_deref(),
         };
-        let response: ContextResponse<PagedAccounts> = rpc(
+        let response: RpcResult<ContextResponse<PagedAccounts>> = rpc(
             client,
             url,
             "getProgramAccountsV2",
             json!([program_id(), config]),
         )
         .await?;
+        fetch_duration += response.fetch_duration;
+        json_deserialize_duration += response.deserialize_duration;
+        response_bytes += response.response_bytes as u64;
+        let response = response.value;
         let slot = response.context.slot;
         let first_slot = *bootstrap_slot.get_or_insert(slot);
         ensure!(
@@ -110,14 +145,26 @@ async fn bootstrap(
             "RPC snapshot context regressed from slot {first_slot} to {slot}"
         );
         let page = response.value;
+        fetched_accounts += page.accounts.len();
+        let decode_started = Instant::now();
         for entry in page.accounts {
             if entry.account.lamports == 0 {
+                skipped_accounts += 1;
                 continue;
             }
             let key = parse_key(&entry.pubkey)?;
-            let account = Account::from_rpc(entry.pubkey, entry.account)?;
+            let pubkey = entry.pubkey.clone();
+            let account = match Account::from_rpc(entry.pubkey, entry.account) {
+                Ok(account) => account,
+                Err(error) => {
+                    tracing::warn!(%pubkey, %error, "skipping invalid ALT account");
+                    skipped_accounts += 1;
+                    continue;
+                }
+            };
             accounts.insert(key, Arc::new(account));
         }
+        account_decode_duration += decode_started.elapsed();
         let Some(next) = page.pagination_key else {
             break;
         };
@@ -125,10 +172,21 @@ async fn bootstrap(
         cursor = Some(next);
     }
 
-    Ok((
-        bootstrap_slot.context("RPC snapshot context missing")?,
-        accounts,
-    ))
+    let bootstrap_slot = bootstrap_slot.context("RPC snapshot context missing")?;
+    tracing::info!(
+        bootstrap_slot,
+        pages = page_number,
+        accounts = accounts.len(),
+        fetched_accounts,
+        skipped_accounts,
+        response_bytes,
+        fetch_ms = fetch_duration.as_millis() as u64,
+        json_deserialize_ms = json_deserialize_duration.as_millis() as u64,
+        account_decode_ms = account_decode_duration.as_millis() as u64,
+        elapsed_ms = bootstrap_started.elapsed().as_millis() as u64,
+        "bootstrap snapshot fetched"
+    );
+    Ok((bootstrap_slot, accounts))
 }
 
 fn next_connected(active: usize, connected: &HashSet<usize>, count: usize) -> Option<usize> {
@@ -224,7 +282,11 @@ pub async fn run(
         };
         let (bootstrap_slot, accounts) = match bootstrap_result {
             Ok(value) => value,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "ALT cache bootstrap RPC failed; retrying"
+                );
                 logging::alert("ALT cache bootstrap RPC failed; readiness is false");
                 tokio::select! {
                     _ = stop.cancelled() => break,
@@ -322,7 +384,14 @@ fn apply(update: SubscribeUpdateAccount, updater: &mut StateUpdater) -> Result<(
     let value = if account.lamports == 0 || owner != program::id().to_bytes() {
         None
     } else {
-        Some(Account::from_yellowstone(account)?)
+        match Account::from_yellowstone(account) {
+            Ok(account) => Some(account),
+            Err(error) => {
+                let pubkey = bs58::encode(key).into_string();
+                tracing::warn!(%pubkey, %error, "removing invalid ALT account");
+                None
+            }
+        }
     };
     updater.queue(key, update.slot, write_version, value)?;
     Ok(())
