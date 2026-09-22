@@ -8,10 +8,10 @@ pub struct Config {
     pub http_addr: SocketAddr,
     pub bootstrap_rpc: BootstrapRpc,
     pub grpc_sources: Vec<GrpcSource>,
-    #[serde(default = "stale_seconds")]
-    pub stale_after_secs: u64,
-    #[serde(default = "reconcile_seconds")]
-    pub reconcile_after_secs: u64,
+    #[serde(default = "yellowstone_idle_timeout_seconds")]
+    pub yellowstone_idle_timeout_secs: u64,
+    #[serde(default = "full_refresh_interval_seconds")]
+    pub full_refresh_interval_secs: u64,
     #[serde(default = "capacity")]
     pub stream_capacity: usize,
     #[serde(default)]
@@ -72,10 +72,10 @@ impl Default for File {
         }
     }
 }
-fn stale_seconds() -> u64 {
+fn yellowstone_idle_timeout_seconds() -> u64 {
     15
 }
-fn reconcile_seconds() -> u64 {
+fn full_refresh_interval_seconds() -> u64 {
     3600
 }
 fn capacity() -> usize {
@@ -89,12 +89,12 @@ impl Config {
         );
         ensure!(self.stream_capacity > 0, "stream_capacity must be positive");
         ensure!(
-            self.stale_after_secs > 0,
-            "stale_after_secs must be positive"
+            self.yellowstone_idle_timeout_secs > 0,
+            "yellowstone_idle_timeout_secs must be positive"
         );
         ensure!(
-            self.reconcile_after_secs > 0,
-            "reconcile_after_secs must be positive"
+            self.full_refresh_interval_secs > 0,
+            "full_refresh_interval_secs must be positive"
         );
         ensure!(self.logging.file.max_days > 0, "max_days must be positive");
         secret(&self.bootstrap_rpc.url_env)?;

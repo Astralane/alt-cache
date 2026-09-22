@@ -52,13 +52,13 @@ fn main() -> Result<()> {
     }
     for (index, source) in config.grpc_sources.iter().cloned().enumerate() {
         let stop = stop.clone();
-        let stale_after_secs = config.stale_after_secs;
+        let idle_timeout_secs = config.yellowstone_idle_timeout_secs;
         let events = source_events.clone();
         spawn_service(
             &format!("alt-yellowstone-{index}"),
             stop.clone(),
             async move {
-                yellowstone::run(index, source, stale_after_secs, events, stop).await;
+                yellowstone::run(index, source, idle_timeout_secs, events, stop).await;
                 Ok(())
             },
         )?;

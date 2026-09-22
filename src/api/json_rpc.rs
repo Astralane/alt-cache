@@ -356,5 +356,57 @@ mod tests {
         let body: Value = serde_json::from_str(response.get()).unwrap();
         assert_eq!(body["result"]["accounts"].as_array().unwrap().len(), 1);
         assert!(body["result"]["paginationKey"].is_null());
+
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"getProgramAccountsV2","params":["{program}",{{"limit":1,"withContext":true}}]}}"#
+        );
+        let (response, _) = rpc.raw_json_request(&request, 1).await.unwrap();
+        let body: Value = serde_json::from_str(response.get()).unwrap();
+        assert_eq!(body["result"]["context"]["slot"], 4);
+        assert_eq!(
+            body["result"]["value"]["accounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let cursor = body["result"]["value"]["paginationKey"].as_str().unwrap();
+
+        let key = [3; 32];
+        updater
+            .queue(
+                key,
+                5,
+                1,
+                Some(Account {
+                    value: SubscribeUpdateAccountInfo {
+                        pubkey: key.to_vec(),
+                        lamports: 1,
+                        owner: vec![0; 32],
+                        executable: false,
+                        rent_epoch: 0,
+                        data: Vec::new(),
+                        write_version: 1,
+                        txn_signature: None,
+                    },
+                }),
+            )
+            .unwrap();
+        updater.confirm(5);
+
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"getProgramAccountsV2","params":["{program}",{{"limit":1,"paginationKey":"{cursor}","withContext":true}}]}}"#
+        );
+        let (response, _) = rpc.raw_json_request(&request, 1).await.unwrap();
+        let body: Value = serde_json::from_str(response.get()).unwrap();
+        assert_eq!(body["result"]["context"]["slot"], 4);
+        assert_eq!(
+            body["result"]["value"]["accounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(body["result"]["value"]["paginationKey"].is_null());
     }
 }

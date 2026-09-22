@@ -16,24 +16,26 @@ The bootstrap RPC is independent of the gRPC sources. It must be Helius or a
 compatible provider implementing paginated `getProgramAccountsV2`. Every gRPC
 source runs an account subscription on its own OS thread and current-thread
 async runtime. The sources send account events through one bounded channel to a
-dedicated state updater. Yellowstone ping, slot, or account traffic keeps a source
-alive; a silent source times out after `stale_after_secs`. The first gRPC source
-is primary; the updater observes all sources but applies account writes only
-from the active source. On failure, it rotates through the configured gRPC
-sources and builds a new snapshot from the bootstrap RPC.
+dedicated state updater. Yellowstone ping, slot, or account traffic keeps a
+source alive; a silent source times out after
+`yellowstone_idle_timeout_secs`. The first gRPC source is primary; the updater
+observes all sources but applies account writes only from the active source. On
+failure, it rotates through the configured gRPC sources and builds a new
+snapshot from the bootstrap RPC.
 It does not compare write versions from different validators.
 
 A source change, transport failure, or source timeout makes the cache unavailable
 until recovery installs a new snapshot.
 
 ALT closure drains the account and clears its data without changing its owner,
-so the owner subscription also reports closures. Full reconciliation runs once
-per `reconcile_after_secs`. It makes the cache unavailable while it rebuilds.
+so the owner subscription also reports closures. A full refresh runs once per
+`full_refresh_interval_secs`. It makes the cache unavailable while it rebuilds.
 
 ## Source requirements
 
 - The bootstrap RPC supports the Helius-compatible `getProgramAccountsV2`
-  method with `base64+zstd`, pagination, and confirmed commitment.
+  method with `base64+zstd`, pagination, `withContext`, and confirmed
+  commitment. The first page's context slot is the bootstrap slot.
 - Yellowstone supports owner-filtered account updates, confirmed slot updates,
   and subscription pings. Historical replay is not required.
 - The RPC and Yellowstone endpoints may be supplied by different providers, but

@@ -58,25 +58,33 @@ struct PagedAccounts {
     pagination_key: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ContextResponse<T> {
+    context: RpcContext,
+    value: T,
+}
+
+#[derive(Deserialize)]
+struct RpcContext {
+    slot: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProgramAccountsConfig<'a> {
     commitment: &'static str,
     encoding: &'static str,
+    with_context: bool,
     limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pagination_key: Option<&'a str>,
-}
-
-async fn get_slot(client: &reqwest::Client, url: &str) -> Result<u64> {
-    rpc(client, url, "getSlot", json!([{"commitment":"confirmed"}])).await
 }
 
 async fn bootstrap(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(u64, BTreeMap<Key, Arc<Account>>)> {
-    let slot = get_slot(client, url).await?;
+    let mut bootstrap_slot = None;
     let mut cursor: Option<String> = None;
     let mut seen = HashSet::new();
     let mut accounts = BTreeMap::new();
@@ -84,16 +92,24 @@ async fn bootstrap(
         let config = ProgramAccountsConfig {
             commitment: "confirmed",
             encoding: "base64+zstd",
+            with_context: true,
             limit: PAGE_SIZE,
             pagination_key: cursor.as_deref(),
         };
-        let page: PagedAccounts = rpc(
+        let response: ContextResponse<PagedAccounts> = rpc(
             client,
             url,
             "getProgramAccountsV2",
             json!([program_id(), config]),
         )
         .await?;
+        let slot = response.context.slot;
+        let first_slot = *bootstrap_slot.get_or_insert(slot);
+        ensure!(
+            slot >= first_slot,
+            "RPC snapshot context regressed from slot {first_slot} to {slot}"
+        );
+        let page = response.value;
         for entry in page.accounts {
             if entry.account.lamports == 0 {
                 continue;
@@ -109,7 +125,10 @@ async fn bootstrap(
         cursor = Some(next);
     }
 
-    Ok((slot, accounts))
+    Ok((
+        bootstrap_slot.context("RPC snapshot context missing")?,
+        accounts,
+    ))
 }
 
 fn next_connected(active: usize, connected: &HashSet<usize>, count: usize) -> Option<usize> {
@@ -215,8 +234,9 @@ pub async fn run(
         };
         updater.install(source.clone(), bootstrap_slot, accounts);
 
-        let reconcile = tokio::time::sleep(Duration::from_secs(config.reconcile_after_secs));
-        tokio::pin!(reconcile);
+        let full_refresh_timer =
+            tokio::time::sleep(Duration::from_secs(config.full_refresh_interval_secs));
+        tokio::pin!(full_refresh_timer);
         while let Some(event) = buffered.pop_front() {
             let result = match event {
                 ActiveEvent::Account(update) => apply(*update, &mut updater),
@@ -238,8 +258,8 @@ pub async fn run(
         loop {
             let event = tokio::select! {
                 _ = stop.cancelled() => break 'recover,
-                _ = &mut reconcile => {
-                    tracing::info!(source, "scheduled reconciliation");
+                _ = &mut full_refresh_timer => {
+                    tracing::info!(source, "starting scheduled full refresh");
                     continue 'recover;
                 }
                 event = events.recv() => event.context("all Yellowstone sources stopped")?,

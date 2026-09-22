@@ -1,6 +1,6 @@
 http_addr = "127.0.0.1:8090"
-stale_after_secs = 15
-reconcile_after_secs = 3600
+yellowstone_idle_timeout_secs = 15
+full_refresh_interval_secs = 3600
 stream_capacity = 4096
 # alert_webhook_env = "ALT_CACHE_ALERT_WEBHOOK"
 

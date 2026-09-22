@@ -34,7 +34,7 @@ pub enum Event {
 pub async fn run(
     source_id: usize,
     source: GrpcSource,
-    stale_after_secs: u64,
+    idle_timeout_secs: u64,
     events: mpsc::Sender<Event>,
     stop: CancellationToken,
 ) {
@@ -42,7 +42,7 @@ pub async fn run(
     loop {
         let result = tokio::select! {
             _ = stop.cancelled() => break,
-            result = session(source_id, &source, &source_url, stale_after_secs, &events) => result,
+            result = session(source_id, &source, &source_url, idle_timeout_secs, &events) => result,
         };
         if result.is_err() {
             tracing::warn!(source = source_url, "Yellowstone source disconnected");
@@ -76,7 +76,7 @@ async fn session(
     source_id: usize,
     source: &GrpcSource,
     source_url: &str,
-    stale_after_secs: u64,
+    idle_timeout_secs: u64,
     events: &mpsc::Sender<Event>,
 ) -> Result<()> {
     let token = source.token_env.as_deref().map(secret).transpose()?;
@@ -90,7 +90,7 @@ async fn session(
         .into_inner();
     events.send(Event::Connected { source: source_id }).await?;
     loop {
-        let update = tokio::time::timeout(Duration::from_secs(stale_after_secs), stream.next())
+        let update = tokio::time::timeout(Duration::from_secs(idle_timeout_secs), stream.next())
             .await?
             .context("source stream closed")??;
         match update.update_oneof {
