@@ -1,6 +1,6 @@
 # Astralane ALT cache
 
-Rust library and in-memory service, version **4.2.1**. Live account updates use
+Rust library and in-memory service, version **4.2.2**. Live account updates use
 **confirmed** commitment.
 
 ## Data flow
@@ -58,8 +58,8 @@ cargo build --release --locked
 ./target/release/astralane-alt-cache config.toml
 ```
 
-The package version starts at 4.2.1. The ALT decoder uses the Solana interface
-and RPC types. SDK component versions are not Agave versions.
+The package version tracks stable Agave 4.2.2. The ALT decoder uses the Solana
+interface and RPC types. SDK component versions are not Agave versions.
 No validator process or Agave runtime is embedded.
 
 ## Library
