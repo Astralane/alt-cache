@@ -31,7 +31,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Connection settings for a consumer-side ALT cache.
 pub struct AltCacheConfig {
-    pub json_rpc_url: String,
+    pub bootstrap_urls: Vec<String>,
     pub yellowstone_sources: Vec<YellowstoneSourceConfig>,
     pub yellowstone_idle_timeout: Duration,
     pub update_buffer_capacity: usize,
@@ -59,12 +59,13 @@ impl YellowstoneSourceConfig {
 }
 
 impl AltCacheConfig {
-    pub fn new(
-        json_rpc_url: impl Into<String>,
-        yellowstone_sources: Vec<YellowstoneSourceConfig>,
-    ) -> Self {
+    pub fn new<I, U>(bootstrap_urls: I, yellowstone_sources: Vec<YellowstoneSourceConfig>) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Into<String>,
+    {
         Self {
-            json_rpc_url: json_rpc_url.into(),
+            bootstrap_urls: bootstrap_urls.into_iter().map(Into::into).collect(),
             yellowstone_sources,
             yellowstone_idle_timeout: Duration::from_secs(15),
             update_buffer_capacity: 4_096,
@@ -103,6 +104,10 @@ impl AltCache {
             "update_buffer_capacity must be positive"
         );
         ensure!(
+            !config.bootstrap_urls.is_empty(),
+            "at least one bootstrap URL is required"
+        );
+        ensure!(
             !config.yellowstone_sources.is_empty(),
             "at least one Yellowstone source is required"
         );
@@ -110,12 +115,20 @@ impl AltCache {
             !config.yellowstone_idle_timeout.is_zero(),
             "yellowstone_idle_timeout must be positive"
         );
-        let mut urls = HashSet::new();
+        let mut bootstrap_urls = HashSet::new();
+        ensure!(
+            config
+                .bootstrap_urls
+                .iter()
+                .all(|url| !url.is_empty() && bootstrap_urls.insert(url)),
+            "bootstrap URLs must be non-empty and unique"
+        );
+        let mut yellowstone_urls = HashSet::new();
         ensure!(
             config
                 .yellowstone_sources
                 .iter()
-                .all(|source| !source.url.is_empty() && urls.insert(&source.url)),
+                .all(|source| !source.url.is_empty() && yellowstone_urls.insert(&source.url)),
             "Yellowstone source URLs must be non-empty and unique"
         );
         let http = reqwest::Client::builder()
@@ -255,7 +268,7 @@ async fn recover_from_source(
         .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
         .await?
         .into_inner();
-    let snapshot = fetch_snapshot(http, &config.json_rpc_url);
+    let snapshot = fetch_snapshot_from_any(http, &config.bootstrap_urls);
     tokio::pin!(snapshot);
     let mut buffered = VecDeque::with_capacity(config.update_buffer_capacity.min(4_096));
     let (slot, tables) = loop {
@@ -369,7 +382,7 @@ async fn fetch_snapshot(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
-    let response: RpcResponse<SnapshotResponse> = http
+    let response = http
         .post(url)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -378,10 +391,12 @@ async fn fetch_snapshot(
             "params": [program_id(), {"commitment":"confirmed", "encoding":"base64", "withContext":true}]
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .await
+        .map_err(redact_rpc_error)?
+        .error_for_status()
+        .map_err(redact_rpc_error)?;
+    let body = response.bytes().await.map_err(redact_rpc_error)?;
+    let response: RpcResponse<SnapshotResponse> = serde_json::from_slice(&body)?;
     if let Some(error) = response.error {
         anyhow::bail!("snapshot RPC error {}: {}", error.code, error.message);
     }
@@ -405,6 +420,31 @@ async fn fetch_snapshot(
         );
     }
     Ok((snapshot.context.slot, tables))
+}
+
+async fn fetch_snapshot_from_any(
+    http: &reqwest::Client,
+    urls: &[String],
+) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
+    let mut last_error = None;
+    for (index, url) in urls.iter().enumerate() {
+        match fetch_snapshot(http, url).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    bootstrap = index,
+                    error = %format!("{error:#}"),
+                    "ALT client bootstrap unavailable"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.context("all bootstrap URLs failed")?)
+}
+
+fn redact_rpc_error(error: reqwest::Error) -> anyhow::Error {
+    anyhow::Error::new(error.without_url())
 }
 
 fn apply_update(
@@ -472,6 +512,10 @@ fn apply_pending_through(session: &mut Session, slot: u64) -> Result<()> {
 mod tests {
     use super::*;
     use solana_address_lookup_table_interface::state::LookupTableMeta;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
     fn account_update(key: Address, lamports: u64) -> SubscribeUpdateAccount {
@@ -493,6 +537,44 @@ mod tests {
             slot: 42,
             is_startup: false,
         }
+    }
+
+    #[test]
+    fn config_accepts_multiple_bootstrap_urls() {
+        let config = AltCacheConfig::new(
+            ["http://primary", "http://secondary"],
+            vec![YellowstoneSourceConfig::new("https://yellowstone")],
+        );
+        assert_eq!(
+            config.bootstrap_urls,
+            vec!["http://primary", "http://secondary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_falls_back_to_next_bootstrap_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0);
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":42},"value":[]}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let urls = vec!["not a URL".to_owned(), format!("http://{address}")];
+        let http = reqwest::Client::new();
+
+        let (slot, tables) = fetch_snapshot_from_any(&http, &urls).await.unwrap();
+
+        assert_eq!(slot, 42);
+        assert!(tables.is_empty());
+        server.await.unwrap();
     }
 
     #[test]

@@ -68,16 +68,20 @@ No validator process or Agave runtime is embedded.
 then maintains a process-local `Arc<DashMap<...>>` from one active Yellowstone
 stream. The stream is opened before the snapshot request and account and
 confirmed-slot updates are buffered during the fetch, so the snapshot-to-live
-handoff has no gap. Yellowstone sources are tried in configuration order and
-rotated after a failure. Recovery builds a fresh map and atomically replaces the
-active map.
+handoff has no gap. Bootstrap URLs are tried in configuration order until one
+returns a valid snapshot. Yellowstone sources are also tried in configuration
+order and rotated after a failure. Recovery builds a fresh map and atomically
+replaces the active map.
 
 ```rust
 use astralane_alt_cache::{AltCache, AltCacheConfig, YellowstoneSourceConfig};
 use solana_address::Address;
 
 let config = AltCacheConfig::new(
-    "http://127.0.0.1:8090",
+    [
+        "http://alt-cache-primary:8090",
+        "http://alt-cache-secondary:8090",
+    ],
     vec![
         YellowstoneSourceConfig::new("https://yellowstone-primary.example.com")
             .with_token(primary_token),
