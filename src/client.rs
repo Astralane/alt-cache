@@ -12,7 +12,7 @@ use solana_address::Address;
 use solana_address_lookup_table_interface::{program, state::AddressLookupTable};
 use solana_message::AddressLookupTableAccount;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,19 +32,41 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Connection settings for a consumer-side ALT cache.
 pub struct AltCacheConfig {
     pub json_rpc_url: String,
-    pub yellowstone_url: String,
-    pub yellowstone_token: Option<String>,
-    pub stale_after: Duration,
+    pub yellowstone_sources: Vec<YellowstoneSourceConfig>,
+    pub yellowstone_idle_timeout: Duration,
     pub update_buffer_capacity: usize,
 }
 
+/// One Yellowstone endpoint and its optional authentication token.
+#[derive(Clone)]
+pub struct YellowstoneSourceConfig {
+    pub url: String,
+    pub token: Option<String>,
+}
+
+impl YellowstoneSourceConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: None,
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+}
+
 impl AltCacheConfig {
-    pub fn new(json_rpc_url: impl Into<String>, yellowstone_url: impl Into<String>) -> Self {
+    pub fn new(
+        json_rpc_url: impl Into<String>,
+        yellowstone_sources: Vec<YellowstoneSourceConfig>,
+    ) -> Self {
         Self {
             json_rpc_url: json_rpc_url.into(),
-            yellowstone_url: yellowstone_url.into(),
-            yellowstone_token: None,
-            stale_after: Duration::from_secs(15),
+            yellowstone_sources,
+            yellowstone_idle_timeout: Duration::from_secs(15),
             update_buffer_capacity: 4_096,
         }
     }
@@ -81,13 +103,25 @@ impl AltCache {
             "update_buffer_capacity must be positive"
         );
         ensure!(
-            !config.stale_after.is_zero(),
-            "stale_after must be positive"
+            !config.yellowstone_sources.is_empty(),
+            "at least one Yellowstone source is required"
+        );
+        ensure!(
+            !config.yellowstone_idle_timeout.is_zero(),
+            "yellowstone_idle_timeout must be positive"
+        );
+        let mut urls = HashSet::new();
+        ensure!(
+            config
+                .yellowstone_sources
+                .iter()
+                .all(|source| !source.url.is_empty() && urls.insert(&source.url)),
+            "Yellowstone source URLs must be non-empty and unique"
         );
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
-        let session = recover(&http, &config).await?;
+        let session = recover(&http, &config, 0).await?;
         let tables = Arc::new(ArcSwap::from(session.tables.clone()));
         let ready = Arc::new(AtomicBool::new(true));
         let confirmed_slot = Arc::new(AtomicU64::new(session.confirmed_slot));
@@ -129,6 +163,7 @@ impl AltCache {
 }
 
 struct Session {
+    source_index: usize,
     bootstrap_slot: u64,
     confirmed_slot: u64,
     tables: Arc<DashMap<Address, AddressLookupTableAccount>>,
@@ -147,18 +182,29 @@ async fn run(
     stop: CancellationToken,
 ) {
     loop {
-        let result = follow(&mut session, &confirmed_slot, &stop, config.stale_after).await;
+        let result = follow(
+            &mut session,
+            &confirmed_slot,
+            &stop,
+            config.yellowstone_idle_timeout,
+        )
+        .await;
         if stop.is_cancelled() {
             return;
         }
         ready.store(false, Ordering::Release);
-        tracing::warn!(error = ?result.err(), "ALT client Yellowstone feed disconnected");
+        tracing::warn!(
+            source = session.source_index,
+            error = ?result.err(),
+            "ALT client Yellowstone feed disconnected"
+        );
+        let next_source = (session.source_index + 1) % config.yellowstone_sources.len();
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return,
                 _ = tokio::time::sleep(RETRY_DELAY) => {}
             }
-            match recover(&http, &config).await {
+            match recover(&http, &config, next_source).await {
                 Ok(recovered) => {
                     tables.store(recovered.tables.clone());
                     confirmed_slot.store(recovered.confirmed_slot, Ordering::Release);
@@ -172,9 +218,36 @@ async fn run(
     }
 }
 
-async fn recover(http: &reqwest::Client, config: &AltCacheConfig) -> Result<Session> {
-    let mut grpc =
-        yellowstone::connect(&config.yellowstone_url, config.yellowstone_token.as_deref()).await?;
+async fn recover(
+    http: &reqwest::Client,
+    config: &AltCacheConfig,
+    first_source: usize,
+) -> Result<Session> {
+    let mut last_error = None;
+    for offset in 0..config.yellowstone_sources.len() {
+        let source_index = (first_source + offset) % config.yellowstone_sources.len();
+        match recover_from_source(http, config, source_index).await {
+            Ok(session) => return Ok(session),
+            Err(error) => {
+                tracing::warn!(
+                    source = source_index,
+                    ?error,
+                    "ALT client source unavailable"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.context("all Yellowstone sources failed")?)
+}
+
+async fn recover_from_source(
+    http: &reqwest::Client,
+    config: &AltCacheConfig,
+    source_index: usize,
+) -> Result<Session> {
+    let source = &config.yellowstone_sources[source_index];
+    let mut grpc = yellowstone::connect(&source.url, source.token.as_deref()).await?;
     let (requests, receiver) = mpsc::channel(8);
     requests.send(yellowstone::subscribe_request()).await?;
     let mut stream = grpc
@@ -214,6 +287,7 @@ async fn recover(http: &reqwest::Client, config: &AltCacheConfig) -> Result<Sess
         }
     };
     let mut session = Session {
+        source_index,
         bootstrap_slot: slot,
         confirmed_slot: slot,
         tables,

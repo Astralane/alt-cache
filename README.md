@@ -62,29 +62,37 @@ No validator process or Agave runtime is embedded.
 ## Library
 
 `AltCache` bootstraps from this service's `getProgramAccounts` JSON-RPC method,
-then maintains a process-local `Arc<DashMap<...>>` from one Yellowstone stream.
-The stream is opened before the snapshot request and account and confirmed-slot
-updates are buffered during the fetch, so the snapshot-to-live handoff has no
-gap. Recovery builds a fresh map and atomically replaces the active map.
+then maintains a process-local `Arc<DashMap<...>>` from one active Yellowstone
+stream. The stream is opened before the snapshot request and account and
+confirmed-slot updates are buffered during the fetch, so the snapshot-to-live
+handoff has no gap. Yellowstone sources are tried in configuration order and
+rotated after a failure. Recovery builds a fresh map and atomically replaces the
+active map.
 
 ```rust
-use astralane_alt_cache::{AltCache, AltCacheConfig};
+use astralane_alt_cache::{AltCache, AltCacheConfig, YellowstoneSourceConfig};
 use solana_address::Address;
 
-let mut config = AltCacheConfig::new(
+let config = AltCacheConfig::new(
     "http://127.0.0.1:8090",
-    "https://yellowstone.example.com",
+    vec![
+        YellowstoneSourceConfig::new("https://yellowstone-primary.example.com")
+            .with_token(primary_token),
+        YellowstoneSourceConfig::new("https://yellowstone-secondary.example.com")
+            .with_token(secondary_token),
+    ],
 );
-config.yellowstone_token = Some(yellowstone_token);
 
 let cache = AltCache::connect(config).await?;
 let key: Address = "ALT_ADDRESS".parse()?;
 let table: Option<solana_message::AddressLookupTableAccount> = cache.get(&key)?;
 ```
 
-`get` returns an error while the local Yellowstone feed is recovering, `None`
-for a missing table, or Solana's standard `AddressLookupTableAccount`. Dropping
-the last clone of `AltCache` stops its background task.
+`AltCache::connect` returns only after the initial snapshot and buffered updates
+have been installed. `get` returns an error while the local Yellowstone feed is
+recovering, `None` for a missing table, or Solana's standard
+`AddressLookupTableAccount`. Dropping the last clone of `AltCache` stops its
+background task.
 
 ## JSON-RPC
 
