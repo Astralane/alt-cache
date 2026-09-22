@@ -6,8 +6,8 @@ use std::{net::SocketAddr, path::PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub http_addr: SocketAddr,
-    pub grpc_addr: SocketAddr,
-    pub sources: Vec<Source>,
+    pub bootstrap_rpc: BootstrapRpc,
+    pub grpc_sources: Vec<GrpcSource>,
     #[serde(default = "stale_seconds")]
     pub stale_after_secs: u64,
     #[serde(default = "reconcile_seconds")]
@@ -20,11 +20,15 @@ pub struct Config {
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Source {
-    pub name: String,
-    pub grpc_url_env: String,
+pub struct BootstrapRpc {
+    pub url_env: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcSource {
+    pub url_env: String,
     pub token_env: Option<String>,
-    pub rpc_url_env: String,
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,22 +83,27 @@ fn capacity() -> usize {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.sources.is_empty(), "at least one source is required");
+        ensure!(
+            !self.grpc_sources.is_empty(),
+            "at least one gRPC source is required"
+        );
         ensure!(self.stream_capacity > 0, "stream_capacity must be positive");
         ensure!(
             self.stale_after_secs > 0,
             "stale_after_secs must be positive"
         );
         ensure!(
-            self.reconcile_after_secs > self.stale_after_secs,
-            "reconcile interval must exceed stale interval"
+            self.reconcile_after_secs > 0,
+            "reconcile_after_secs must be positive"
         );
         ensure!(self.logging.file.max_days > 0, "max_days must be positive");
-        let mut names = std::collections::HashSet::new();
-        for source in &self.sources {
-            ensure!(names.insert(&source.name), "source names must be unique");
-            secret(&source.grpc_url_env)?;
-            secret(&source.rpc_url_env)?;
+        secret(&self.bootstrap_rpc.url_env)?;
+        let mut urls = std::collections::HashSet::new();
+        for source in &self.grpc_sources {
+            ensure!(
+                urls.insert(secret(&source.url_env)?),
+                "gRPC source URLs must be unique"
+            );
             if let Some(name) = &source.token_env {
                 secret(name)?;
             }
@@ -118,7 +127,8 @@ mod tests {
     #[test]
     fn example_config_parses() {
         let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
-        assert_eq!(c.sources.len(), 2);
+        assert_eq!(c.bootstrap_rpc.url_env, "ALT_BOOTSTRAP_RPC_URL");
+        assert_eq!(c.grpc_sources.len(), 2);
         assert_eq!(c.stream_capacity, 4096);
     }
     #[test]

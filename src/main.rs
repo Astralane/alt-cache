@@ -1,9 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use astralane_alt_cache::{
     api,
     config::{Config, secret},
-    feed, logging,
+    logging,
     store::Store,
+    updater, yellowstone,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
@@ -11,9 +12,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
-    thread::JoinHandle,
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,91 +26,72 @@ fn main() -> Result<()> {
     let config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
     config.validate()?;
     let _guards = logging::init(&config.logging)?;
-    let alerts = logging::Alerts::start(
+    logging::init_alerts(
         config
             .alert_webhook_env
             .as_deref()
             .map(secret)
             .transpose()?,
     )?;
-    install_panic_hook(alerts.clone());
+    install_panic_hook();
 
     let config = Arc::new(config);
-    let store = Arc::new(Store::new(
-        config.stream_capacity,
-        Duration::from_secs(config.stale_after_secs),
-    ));
+    let store = Arc::new(Store::new());
     let stop = CancellationToken::new();
-    let (exits, exit_events) = sync_channel(config.sources.len() + 3);
-    let mut services = Vec::with_capacity(config.sources.len() + 3);
+    let (source_events, events) = tokio::sync::mpsc::channel(config.stream_capacity);
 
     {
         let config = config.clone();
         let store = store.clone();
-        let alerts = alerts.clone();
         let stop = stop.clone();
-        services.push(spawn_service("alt-feed", exits.clone(), async move {
-            feed::run(config, store, alerts, stop).await;
-            Ok(())
-        })?);
+        spawn_service(
+            "alt-state-updater",
+            stop.clone(),
+            updater::run(config, store, events, stop),
+        )?;
     }
-    for (index, source) in config.sources.iter().cloned().enumerate() {
-        let store = store.clone();
+    for (index, source) in config.grpc_sources.iter().cloned().enumerate() {
         let stop = stop.clone();
-        services.push(spawn_service(
-            &format!("alt-monitor-{index}"),
-            exits.clone(),
+        let stale_after_secs = config.stale_after_secs;
+        let events = source_events.clone();
+        spawn_service(
+            &format!("alt-yellowstone-{index}"),
+            stop.clone(),
             async move {
-                feed::monitor(source, store, stop).await;
+                yellowstone::run(index, source, stale_after_secs, events, stop).await;
                 Ok(())
             },
-        )?);
+        )?;
     }
+    drop(source_events);
     {
         let store = store.clone();
         let stop = stop.clone();
         let addr = config.http_addr;
-        services.push(spawn_service("alt-json-rpc", exits.clone(), async move {
-            api::serve_json(addr, store, stop).await
-        })?);
+        spawn_service(
+            "alt-json-rpc",
+            stop.clone(),
+            api::serve_json(addr, store, stop),
+        )?;
     }
-    {
-        let store = store.clone();
-        let stop = stop.clone();
-        let addr = config.grpc_addr;
-        services.push(spawn_service("alt-grpc", exits.clone(), async move {
-            api::serve_grpc(addr, store, stop).await
-        })?);
-    }
-    drop(exits);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        service_threads = services.len(),
+        service_threads = config.grpc_sources.len() + 2,
         "ALT cache started"
     );
-    let result = wait_for_shutdown(exit_events, &stop)?;
-    store.invalidate();
+    wait_for_shutdown()?;
     stop.cancel();
-    for service in services {
-        if service.join().is_err() && result.is_ok() {
-            return Err(anyhow!("service thread panicked"));
-        }
-    }
-    result
+    Ok(())
 }
 
-fn spawn_service<F>(
-    name: &str,
-    exits: SyncSender<(String, Result<()>)>,
-    future: F,
-) -> Result<JoinHandle<()>>
+fn spawn_service<F>(name: &str, stop: CancellationToken, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
     let name = name.to_owned();
     let thread_name = name.clone();
-    Ok(std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
@@ -120,36 +100,27 @@ where
                 .build()
                 .map_err(anyhow::Error::from)
                 .and_then(|runtime| runtime.block_on(future));
-            let _ = exits.send((name, result));
-        })?)
+            if !stop.is_cancelled() {
+                match result {
+                    Ok(()) => panic!("{name} exited unexpectedly"),
+                    Err(error) => panic!("{name} failed: {error:#}"),
+                }
+            }
+        })?;
+    Ok(())
 }
 
-fn wait_for_shutdown(
-    exits: Receiver<(String, Result<()>)>,
-    stop: &CancellationToken,
-) -> Result<Result<()>> {
+fn wait_for_shutdown() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, shutdown.clone())?;
     signal_hook::flag::register(SIGTERM, shutdown.clone())?;
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(Ok(()));
-        }
-        match exits.recv_timeout(Duration::from_millis(100)) {
-            Ok((name, Ok(()))) if !stop.is_cancelled() => {
-                return Ok(Err(anyhow!("{name} exited unexpectedly")));
-            }
-            Ok((name, Err(error))) => return Ok(Err(error.context(name))),
-            Ok(_) => {}
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Ok(Err(anyhow!("all services exited unexpectedly")));
-            }
-        }
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
-fn install_panic_hook(alerts: logging::Alerts) {
+fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -163,7 +134,7 @@ fn install_panic_hook(alerts: logging::Alerts) {
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("non-string panic");
         tracing::error!(%location, %message, "ALT cache panicked");
-        alerts.send(format!("ALT cache panic at {location}: {message}"));
         previous(info);
+        std::process::exit(1);
     }));
 }

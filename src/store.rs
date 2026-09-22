@@ -1,15 +1,21 @@
 use anyhow::{Context, Result, ensure};
+use arc_swap::ArcSwap;
 use base64::{Engine, prelude::BASE64_STANDARD};
+use im::OrdMap;
 use serde::{Deserialize, Serialize};
-use solana_account_decoder_client_types::{UiAccount, UiAccountData, UiAccountEncoding};
+use solana_account_decoder_client_types::{
+    UiAccount, UiAccountData, UiAccountEncoding, UiDataSliceConfig,
+};
 use solana_address_lookup_table_interface::{program, state::AddressLookupTable};
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Bound::{Excluded, Unbounded},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
 pub type Key = [u8; 32];
@@ -32,11 +38,14 @@ pub fn parse_key(s: &str) -> Result<Key> {
 
 #[derive(Clone)]
 pub struct Account {
-    pub slot: u64,
-    pub value: SubscribeUpdateAccountInfo,
+    pub(crate) value: SubscribeUpdateAccountInfo,
 }
 impl Account {
-    pub fn from_yellowstone(slot: u64, value: SubscribeUpdateAccountInfo) -> Result<Self> {
+    pub fn value(&self) -> &SubscribeUpdateAccountInfo {
+        &self.value
+    }
+
+    pub fn from_yellowstone(value: SubscribeUpdateAccountInfo) -> Result<Self> {
         ensure!(
             value.owner.as_slice() == program::id().to_bytes(),
             "account owner is not ALT program"
@@ -44,36 +53,64 @@ impl Account {
         ensure!(value.pubkey.len() == 32, "invalid account pubkey");
         AddressLookupTable::deserialize(&value.data)
             .map_err(|_| anyhow::anyhow!("invalid ALT data"))?;
-        Ok(Self { slot, value })
+        Ok(Self { value })
     }
 
-    pub fn from_rpc(pubkey: String, account: UiAccount, slot: u64) -> Result<Self> {
+    pub fn from_rpc(pubkey: String, account: UiAccount) -> Result<Self> {
         let data = account.data.decode().context("invalid RPC account data")?;
-        Self::from_yellowstone(
-            slot,
-            SubscribeUpdateAccountInfo {
-                pubkey: parse_key(&pubkey)?.to_vec(),
-                lamports: account.lamports,
-                owner: parse_key(&account.owner)?.to_vec(),
-                executable: account.executable,
-                rent_epoch: account.rent_epoch,
-                data,
-                write_version: 0,
-                txn_signature: None,
-            },
-        )
+        Self::from_yellowstone(SubscribeUpdateAccountInfo {
+            pubkey: parse_key(&pubkey)?.to_vec(),
+            lamports: account.lamports,
+            owner: parse_key(&account.owner)?.to_vec(),
+            executable: account.executable,
+            rent_epoch: account.rent_epoch,
+            data,
+            write_version: 0,
+            txn_signature: None,
+        })
     }
 
     pub fn to_keyed_ui_account(&self) -> Result<KeyedUiAccount> {
-        let data = zstd::stream::encode_all(self.value.data.as_slice(), 0)?;
+        self.to_keyed_ui_account_with_config(UiAccountEncoding::Base64Zstd, None)
+    }
+
+    pub fn to_keyed_ui_account_with_config(
+        &self,
+        encoding: UiAccountEncoding,
+        data_slice: Option<UiDataSliceConfig>,
+    ) -> Result<KeyedUiAccount> {
+        let data = if let Some(slice) = data_slice {
+            let start = slice.offset.min(self.value.data.len());
+            let end = start
+                .saturating_add(slice.length)
+                .min(self.value.data.len());
+            &self.value.data[start..end]
+        } else {
+            &self.value.data
+        };
+        let data = match encoding {
+            UiAccountEncoding::Binary => {
+                UiAccountData::LegacyBinary(bs58::encode(data).into_string())
+            }
+            UiAccountEncoding::Base58 => {
+                UiAccountData::Binary(bs58::encode(data).into_string(), encoding)
+            }
+            UiAccountEncoding::Base64 => {
+                UiAccountData::Binary(BASE64_STANDARD.encode(data), encoding)
+            }
+            UiAccountEncoding::Base64Zstd => UiAccountData::Binary(
+                BASE64_STANDARD.encode(zstd::stream::encode_all(data, 0)?),
+                encoding,
+            ),
+            UiAccountEncoding::JsonParsed => {
+                anyhow::bail!("jsonParsed account encoding is unsupported")
+            }
+        };
         Ok(KeyedUiAccount {
             pubkey: bs58::encode(&self.value.pubkey).into_string(),
             account: UiAccount {
                 lamports: self.value.lamports,
-                data: UiAccountData::Binary(
-                    BASE64_STANDARD.encode(data),
-                    UiAccountEncoding::Base64Zstd,
-                ),
+                data,
                 owner: bs58::encode(&self.value.owner).into_string(),
                 executable: self.value.executable,
                 rent_epoch: self.value.rent_epoch,
@@ -83,218 +120,237 @@ impl Account {
     }
 }
 
-#[derive(Clone)]
-pub enum Event {
-    Write {
-        sequence: u64,
-        key: Key,
-        account: Option<Arc<Account>>,
-        slot: u64,
-    },
-    Reset,
-}
-
-pub struct Snapshot {
-    pub epoch: String,
-    pub sequence: u64,
+pub(crate) struct ReadSnapshot {
     pub slot: u64,
-    pub accounts: Vec<Arc<Account>>,
-    pub receiver: broadcast::Receiver<Event>,
+    pub accounts: OrdMap<Key, Arc<Account>>,
 }
-pub struct SnapshotPage {
-    pub epoch: String,
-    pub sequence: u64,
+pub(crate) struct SnapshotPage {
     pub slot: u64,
     pub accounts: Vec<Arc<Account>>,
     pub next: Option<Key>,
 }
-struct State {
-    epoch: String,
-    sequence: u64,
-    source: Option<String>,
-    ready: bool,
+struct ServerSnapshot {
     slot: u64,
-    baseline: u64,
-    last_progress: Instant,
-    accounts: BTreeMap<Key, Arc<Account>>,
-    versions: HashMap<Key, (u64, u64)>,
+    accounts: OrdMap<Key, Arc<Account>>,
+}
+struct RetainedSnapshot {
+    snapshot: Arc<ServerSnapshot>,
+    touched: Instant,
 }
 pub struct Store {
-    state: RwLock<State>,
-    events: broadcast::Sender<Event>,
-    stale_after: Duration,
-    sources: RwLock<HashMap<String, (u64, Instant)>>,
+    current: ArcSwap<ServerSnapshot>,
+    ready: AtomicBool,
+    source: RwLock<Option<String>>,
+    retained: Mutex<HashMap<u64, RetainedSnapshot>>,
 }
 #[derive(Clone, Serialize)]
 pub struct Health {
     pub ready: bool,
-    pub epoch: String,
     pub source: Option<String>,
-    pub processed_slot: u64,
+    pub confirmed_slot: u64,
     pub accounts: usize,
-    pub progress_age_ms: u128,
-    pub sources: HashMap<String, SourceHealth>,
-}
-#[derive(Clone, Serialize)]
-pub struct SourceHealth {
-    pub slot: u64,
-    pub fresh: bool,
 }
 impl Store {
-    pub fn new(capacity: usize, stale_after: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
-            events: broadcast::channel(capacity).0,
-            stale_after,
-            sources: RwLock::new(HashMap::new()),
-            state: RwLock::new(State {
-                epoch: uuid::Uuid::new_v4().to_string(),
-                sequence: 0,
-                source: None,
-                ready: false,
+            current: ArcSwap::from_pointee(ServerSnapshot {
                 slot: 0,
-                baseline: 0,
-                last_progress: Instant::now(),
-                accounts: BTreeMap::new(),
-                versions: HashMap::new(),
+                accounts: OrdMap::new(),
             }),
+            ready: AtomicBool::new(false),
+            source: RwLock::new(None),
+            retained: Mutex::new(HashMap::new()),
         }
     }
-    pub fn invalidate(&self) {
-        let mut s = self.state.write().unwrap();
-        s.ready = false;
-        let _ = self.events.send(Event::Reset);
-    }
-    pub fn install(&self, source: String, slot: u64, accounts: BTreeMap<Key, Arc<Account>>) {
-        let mut s = self.state.write().unwrap();
-        let _ = self.events.send(Event::Reset);
-        *s = State {
-            epoch: uuid::Uuid::new_v4().to_string(),
-            sequence: 0,
-            source: Some(source),
-            ready: false,
-            slot,
-            baseline: slot,
-            last_progress: Instant::now(),
-            accounts,
-            versions: HashMap::new(),
-        };
-    }
-    pub fn progress(&self, slot: u64, target: u64) -> bool {
-        let mut s = self.state.write().unwrap();
-        if slot > s.slot {
-            s.last_progress = Instant::now();
-            s.slot = slot;
-        }
-        let became_ready = !s.ready && slot >= target;
-        s.ready |= became_ready;
-        became_ready
-    }
-    pub fn apply(&self, key: Key, slot: u64, version: u64, account: Option<Account>) -> bool {
-        let mut s = self.state.write().unwrap();
-        if slot <= s.baseline
-            || s.versions
-                .get(&key)
-                .is_some_and(|old| *old >= (slot, version))
-        {
-            return false;
-        }
-        s.versions.insert(key, (slot, version));
-        let account = account.map(Arc::new);
-        if let Some(account) = &account {
-            s.accounts.insert(key, account.clone());
-        } else {
-            s.accounts.remove(&key);
-        }
-        s.sequence += 1;
-        let _ = self.events.send(Event::Write {
-            sequence: s.sequence,
-            key,
-            account,
-            slot,
-        });
-        true
-    }
-    fn available(&self, s: &State) -> Result<()> {
-        ensure!(
-            s.ready && s.last_progress.elapsed() < self.stale_after,
-            "cache is not ready"
-        );
-        Ok(())
-    }
-    pub fn get(&self, key: &Key) -> Result<(String, u64, u64, Option<Arc<Account>>)> {
-        let s = self.state.read().unwrap();
-        self.available(&s)?;
-        Ok((
-            s.epoch.clone(),
-            s.sequence,
-            s.slot,
-            s.accounts.get(key).cloned(),
-        ))
-    }
-    pub fn snapshot(&self) -> Result<Snapshot> {
-        let s = self.state.read().unwrap();
-        self.available(&s)?;
-        Ok(Snapshot {
-            epoch: s.epoch.clone(),
-            sequence: s.sequence,
-            slot: s.slot,
-            accounts: s.accounts.values().cloned().collect(),
-            receiver: self.events.subscribe(),
+    pub(crate) fn read_snapshot(&self) -> Result<ReadSnapshot> {
+        ensure!(self.ready.load(Ordering::Acquire), "cache is not ready");
+        let snapshot = self.current.load_full();
+        Ok(ReadSnapshot {
+            slot: snapshot.slot,
+            accounts: snapshot.accounts.clone(),
         })
     }
-    pub fn snapshot_page(&self, after: Option<Key>, limit: usize) -> Result<SnapshotPage> {
+    pub(crate) fn snapshot_page(
+        &self,
+        snapshot_slot: Option<u64>,
+        after: Option<Key>,
+        limit: usize,
+    ) -> Result<SnapshotPage> {
         ensure!(limit > 0, "snapshot page limit must be positive");
-        let s = self.state.read().unwrap();
-        self.available(&s)?;
+        ensure!(self.ready.load(Ordering::Acquire), "cache is not ready");
+        let snapshot = if let Some(slot) = snapshot_slot {
+            let mut retained = self.retained.lock().unwrap();
+            retained.retain(|_, value| value.touched.elapsed() < Duration::from_secs(300));
+            let retained = retained
+                .get_mut(&slot)
+                .context("snapshot expired; restart pagination")?;
+            retained.touched = Instant::now();
+            retained.snapshot.clone()
+        } else {
+            self.current.load_full()
+        };
         let lower = after.map_or(Unbounded, Excluded);
-        let range = s.accounts.range((lower, Unbounded));
+        let range = snapshot.accounts.range((lower, Unbounded));
         let mut accounts: Vec<_> = range
             .take(limit + 1)
             .map(|(key, value)| (*key, value.clone()))
             .collect();
         let next = (accounts.len() > limit).then(|| accounts[limit - 1].0);
         accounts.truncate(limit);
+        if next.is_some() {
+            self.retained
+                .lock()
+                .unwrap()
+                .entry(snapshot.slot)
+                .or_insert(RetainedSnapshot {
+                    snapshot: snapshot.clone(),
+                    touched: Instant::now(),
+                });
+        }
         Ok(SnapshotPage {
-            epoch: s.epoch.clone(),
-            sequence: s.sequence,
-            slot: s.slot,
+            slot: snapshot.slot,
             accounts: accounts.into_iter().map(|(_, account)| account).collect(),
             next,
         })
     }
     pub fn health(&self) -> Health {
-        let s = self.state.read().unwrap();
+        let snapshot = self.current.load();
         Health {
-            ready: self.available(&s).is_ok(),
-            epoch: s.epoch.clone(),
-            source: s.source.clone(),
-            processed_slot: s.slot,
-            accounts: s.accounts.len(),
-            progress_age_ms: s.last_progress.elapsed().as_millis(),
-            sources: self
-                .sources
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(name, (slot, at))| {
-                    (
-                        name.clone(),
-                        SourceHealth {
-                            slot: *slot,
-                            fresh: at.elapsed() < self.stale_after,
-                        },
-                    )
-                })
-                .collect(),
+            ready: self.ready.load(Ordering::Acquire),
+            source: self.source.read().unwrap().clone(),
+            confirmed_slot: snapshot.slot,
+            accounts: snapshot.accounts.len(),
         }
     }
-    pub fn source_progress(&self, source: &str, slot: u64) {
-        let mut sources = self.sources.write().unwrap();
-        if sources
-            .get(source)
-            .is_none_or(|(previous, _)| slot > *previous)
+
+    fn invalidate(&self) {
+        self.ready.store(false, Ordering::Release);
+    }
+
+    fn publish(&self, source: &str, slot: u64, accounts: OrdMap<Key, Arc<Account>>) {
+        let current = self.current.load();
+        if current.slot != slot || current.slot == 0 {
+            self.current
+                .store(Arc::new(ServerSnapshot { slot, accounts }));
+        }
+        *self.source.write().unwrap() = Some(source.to_owned());
+        self.ready.store(true, Ordering::Release);
+    }
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) struct StateUpdater {
+    store: Arc<Store>,
+    bootstrap_slot: u64,
+    confirmed_slot: u64,
+    source: String,
+    accounts: OrdMap<Key, Arc<Account>>,
+    pending: BTreeMap<u64, Vec<Mutation>>,
+    versions: HashMap<Key, (u64, u64)>,
+    recovering: bool,
+}
+
+struct Mutation {
+    key: Key,
+    account: Option<Account>,
+}
+
+impl StateUpdater {
+    pub(crate) fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            bootstrap_slot: 0,
+            confirmed_slot: 0,
+            source: String::new(),
+            accounts: OrdMap::new(),
+            pending: BTreeMap::new(),
+            versions: HashMap::new(),
+            recovering: true,
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.store.invalidate();
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        source: String,
+        slot: u64,
+        accounts: BTreeMap<Key, Arc<Account>>,
+    ) {
+        self.store.invalidate();
+        self.source = source;
+        self.bootstrap_slot = slot;
+        self.confirmed_slot = slot;
+        self.accounts = accounts.into_iter().collect();
+        self.pending.clear();
+        self.versions.clear();
+        self.recovering = true;
+    }
+
+    pub(crate) fn finish_recovery(&mut self) {
+        self.apply_pending_through(self.confirmed_slot);
+        self.store
+            .publish(&self.source, self.confirmed_slot, self.accounts.clone());
+        self.recovering = false;
+    }
+
+    pub(crate) fn queue(
+        &mut self,
+        key: Key,
+        slot: u64,
+        version: u64,
+        account: Option<Account>,
+    ) -> Result<bool> {
+        ensure!(
+            self.recovering || slot > self.confirmed_slot,
+            "account update arrived after its slot was confirmed"
+        );
+        if slot < self.bootstrap_slot
+            || self
+                .versions
+                .get(&key)
+                .is_some_and(|old| *old >= (slot, version))
         {
-            sources.insert(source.into(), (slot, Instant::now()));
+            return Ok(false);
+        }
+        self.versions.insert(key, (slot, version));
+        self.pending
+            .entry(slot)
+            .or_default()
+            .push(Mutation { key, account });
+        Ok(true)
+    }
+
+    pub(crate) fn confirm(&mut self, slot: u64) -> bool {
+        if slot <= self.confirmed_slot {
+            return false;
+        }
+        self.apply_pending_through(slot);
+        self.confirmed_slot = slot;
+        if !self.recovering {
+            self.store
+                .publish(&self.source, slot, self.accounts.clone());
+        }
+        true
+    }
+
+    fn apply_pending_through(&mut self, slot: u64) {
+        let slots: Vec<_> = self.pending.range(..=slot).map(|(slot, _)| *slot).collect();
+        for slot in slots {
+            for mutation in self.pending.remove(&slot).unwrap() {
+                if let Some(account) = mutation.account {
+                    self.accounts.insert(mutation.key, Arc::new(account));
+                } else {
+                    self.accounts.remove(&mutation.key);
+                }
+            }
         }
     }
 }
@@ -304,7 +360,6 @@ mod tests {
     use super::*;
     fn account(key: Key) -> Account {
         Account {
-            slot: 13,
             value: SubscribeUpdateAccountInfo {
                 pubkey: key.to_vec(),
                 lamports: 1,
@@ -317,11 +372,12 @@ mod tests {
             },
         }
     }
-    fn store() -> Store {
-        let s = Store::new(2, Duration::from_secs(10));
-        s.install("one".into(), 10, BTreeMap::new());
-        s.progress(12, 11);
-        s
+    fn store() -> (Arc<Store>, StateUpdater) {
+        let store = Arc::new(Store::new());
+        let mut updater = StateUpdater::new(store.clone());
+        updater.install("one".into(), 10, BTreeMap::new());
+        updater.finish_recovery();
+        (store, updater)
     }
     #[test]
     fn yellowstone_account_preserves_binary_data() {
@@ -334,19 +390,16 @@ mod tests {
             addresses: std::borrow::Cow::Owned(vec![program::id()]),
         };
         let data = table.serialize_for_tests().unwrap();
-        let account = Account::from_yellowstone(
-            43,
-            SubscribeUpdateAccountInfo {
-                pubkey: vec![1; 32],
-                lamports: 1234,
-                owner: program::id().to_bytes().to_vec(),
-                executable: false,
-                rent_epoch: 9,
-                data: data.clone(),
-                write_version: 5,
-                txn_signature: None,
-            },
-        )
+        let account = Account::from_yellowstone(SubscribeUpdateAccountInfo {
+            pubkey: vec![1; 32],
+            lamports: 1234,
+            owner: program::id().to_bytes().to_vec(),
+            executable: false,
+            rent_epoch: 9,
+            data: data.clone(),
+            write_version: 5,
+            txn_signature: None,
+        })
         .unwrap();
         assert_eq!(account.value.data, data);
         assert_eq!(account.value.lamports, 1234);
@@ -357,84 +410,47 @@ mod tests {
     #[test]
     fn invalid_alt_is_rejected() {
         assert!(
-            Account::from_yellowstone(
-                1,
-                SubscribeUpdateAccountInfo {
-                    pubkey: vec![1; 32],
-                    lamports: 1,
-                    owner: program::id().to_bytes().to_vec(),
-                    executable: false,
-                    rent_epoch: 0,
-                    data: Vec::new(),
-                    write_version: 0,
-                    txn_signature: None,
-                },
-            )
+            Account::from_yellowstone(SubscribeUpdateAccountInfo {
+                pubkey: vec![1; 32],
+                lamports: 1,
+                owner: program::id().to_bytes().to_vec(),
+                executable: false,
+                rent_epoch: 0,
+                data: Vec::new(),
+                write_version: 0,
+                txn_signature: None,
+            })
             .is_err()
         );
     }
     #[test]
-    fn repeated_slot_does_not_extend_readiness() {
-        let s = store();
-        s.state.write().unwrap().last_progress = Instant::now() - Duration::from_secs(11);
-        assert!(!s.progress(12, 11));
+    fn write_order_accepts_bootstrap_slot_and_rejects_older_versions() {
+        let store = Arc::new(Store::new());
+        let mut updater = StateUpdater::new(store);
+        updater.install("one".into(), 10, BTreeMap::new());
+        assert!(updater.queue([1; 32], 10, 100, None).unwrap());
+        assert!(!updater.queue([1; 32], 10, 99, None).unwrap());
+        assert!(updater.queue([1; 32], 12, 2, None).unwrap());
+        assert!(!updater.queue([1; 32], 12, 1, None).unwrap());
+        assert!(!updater.queue([1; 32], 11, 999, None).unwrap());
+    }
+    #[test]
+    fn source_change_resets_version_domain() {
+        let (s, mut updater) = store();
+        updater.queue([1; 32], 13, 999, None).unwrap();
+        updater.install("two".into(), 10, BTreeMap::new());
         assert!(!s.health().ready);
-        assert!(s.get(&[1; 32]).is_err());
-    }
-    #[test]
-    fn tombstones_reject_old_writes_and_baseline_replay() {
-        let s = store();
-        assert!(!s.apply([1; 32], 10, 100, None));
-        assert!(s.apply([1; 32], 12, 2, None));
-        assert!(!s.apply([1; 32], 12, 1, None));
-        assert!(!s.apply([1; 32], 11, 999, None));
-    }
-    #[test]
-    fn snapshot_and_updates_have_no_gap() {
-        let s = store();
-        let mut snapshot = s.snapshot().unwrap();
-        assert!(s.apply([1; 32], 13, 1, None));
-        assert!(matches!(
-            snapshot.receiver.try_recv().unwrap(),
-            Event::Write { sequence: 1, .. }
-        ));
-        s.invalidate();
-        assert!(matches!(
-            snapshot.receiver.try_recv().unwrap(),
-            Event::Reset
-        ));
-        assert!(s.snapshot().is_err());
-    }
-    #[test]
-    fn source_change_resets_version_domain_and_epoch() {
-        let s = store();
-        let epoch = s.health().epoch;
-        s.apply([1; 32], 13, 999, None);
-        s.install("two".into(), 10, BTreeMap::new());
-        assert_ne!(epoch, s.health().epoch);
-        assert!(!s.health().ready);
-        assert!(s.apply([1; 32], 13, 1, None));
-    }
-    #[test]
-    fn slow_subscribers_get_a_gap_error() {
-        let s = store();
-        let mut snapshot = s.snapshot().unwrap();
-        for version in 0..4 {
-            s.apply([1; 32], 13, version, None);
-        }
-        assert!(matches!(
-            snapshot.receiver.try_recv(),
-            Err(broadcast::error::TryRecvError::Lagged(_))
-        ));
+        assert!(updater.queue([1; 32], 13, 1, None).unwrap());
     }
     #[test]
     fn snapshot_pages_use_exclusive_ordered_cursors() {
-        let s = store();
+        let (s, mut updater) = store();
         for value in [3, 1, 2] {
             let key = [value; 32];
-            assert!(s.apply(key, 13, 1, Some(account(key))));
+            assert!(updater.queue(key, 13, 1, Some(account(key))).unwrap());
         }
-        let first = s.snapshot_page(None, 2).unwrap();
+        updater.confirm(13);
+        let first = s.snapshot_page(None, None, 2).unwrap();
         assert_eq!(
             first
                 .accounts
@@ -443,11 +459,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![[1; 32].as_slice(), [2; 32].as_slice()]
         );
-        let second = s.snapshot_page(first.next, 2).unwrap();
-        assert_eq!(second.sequence, first.sequence);
+        let first_slot = first.slot;
+        let first_cursor = first.next;
+        let extra = [4; 32];
+        updater.queue(extra, 14, 1, Some(account(extra))).unwrap();
+        updater.confirm(14);
+        let second = s.snapshot_page(Some(first_slot), first_cursor, 2).unwrap();
         assert_eq!(second.accounts.len(), 1);
         assert_eq!(second.accounts[0].value.pubkey, vec![3; 32]);
         assert!(second.next.is_none());
-        assert!(!first.epoch.is_empty());
     }
 }

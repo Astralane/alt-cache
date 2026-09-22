@@ -1,9 +1,9 @@
 pub mod api;
+mod client;
 pub mod config;
-pub mod feed;
 pub mod logging;
 pub mod store;
+pub mod updater;
+pub mod yellowstone;
 
-pub mod proto {
-    tonic::include_proto!("astralane.alt.v1");
-}
+pub use client::{AltCache, AltCacheConfig};

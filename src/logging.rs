@@ -1,7 +1,10 @@
 use crate::config::Logging;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use std::{
-    sync::mpsc::{SyncSender, sync_channel},
+    sync::{
+        OnceLock,
+        mpsc::{SyncSender, sync_channel},
+    },
     time::Duration,
 };
 use tracing_appender::non_blocking::WorkerGuard;
@@ -47,13 +50,10 @@ pub fn init(config: &Logging) -> Result<Vec<WorkerGuard>> {
     Ok(guards)
 }
 
-#[derive(Clone)]
-pub struct Alerts(Option<SyncSender<String>>);
-impl Alerts {
-    pub fn start(webhook: Option<String>) -> Result<Self> {
-        let Some(webhook) = webhook else {
-            return Ok(Self(None));
-        };
+static ALERTS: OnceLock<Option<SyncSender<String>>> = OnceLock::new();
+
+pub fn init_alerts(webhook: Option<String>) -> Result<()> {
+    let sender = if let Some(webhook) = webhook {
         let (sender, receiver) = sync_channel::<String>(32);
         std::thread::Builder::new()
             .name("alt-alerts".into())
@@ -87,15 +87,19 @@ impl Alerts {
                     }
                 }
             })?;
-        Ok(Self(Some(sender)))
-    }
-    pub fn send(&self, text: String) {
-        if self
-            .0
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(text).is_err())
-        {
-            tracing::warn!("alert queue full");
-        }
+        Some(sender)
+    } else {
+        None
+    };
+    ensure!(ALERTS.set(sender).is_ok(), "alerts already initialized");
+    Ok(())
+}
+
+pub fn alert(text: impl Into<String>) {
+    let Some(sender) = ALERTS.get().and_then(Option::as_ref) else {
+        return;
+    };
+    if sender.try_send(text.into()).is_err() {
+        tracing::warn!("alert queue full");
     }
 }
