@@ -28,23 +28,26 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const YELLOWSTONE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const UPDATE_BUFFER_CAPACITY: usize = 4_096;
 
-/// Connection settings for a consumer-side ALT cache.
-pub struct AltCacheConfig {
-    pub bootstrap_urls: Vec<String>,
-    pub yellowstone_sources: Vec<YellowstoneSourceConfig>,
-    pub yellowstone_idle_timeout: Duration,
-    pub update_buffer_capacity: usize,
+/// Bootstrap and live-source endpoints used to initialize an ALT cache.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AltConfig {
+    pub rpc: Vec<String>,
+    pub yellowstone_grpc: Vec<YellowstoneGrpcConfig>,
 }
 
 /// One Yellowstone endpoint and its optional authentication token.
-#[derive(Clone)]
-pub struct YellowstoneSourceConfig {
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YellowstoneGrpcConfig {
     pub url: String,
     pub token: Option<String>,
 }
 
-impl YellowstoneSourceConfig {
+impl YellowstoneGrpcConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -55,21 +58,6 @@ impl YellowstoneSourceConfig {
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
-    }
-}
-
-impl AltCacheConfig {
-    pub fn new<I, U>(bootstrap_urls: I, yellowstone_sources: Vec<YellowstoneSourceConfig>) -> Self
-    where
-        I: IntoIterator<Item = U>,
-        U: Into<String>,
-    {
-        Self {
-            bootstrap_urls: bootstrap_urls.into_iter().map(Into::into).collect(),
-            yellowstone_sources,
-            yellowstone_idle_timeout: Duration::from_secs(15),
-            update_buffer_capacity: 4_096,
-        }
     }
 }
 
@@ -98,35 +86,24 @@ impl Drop for Inner {
 
 impl AltCache {
     /// Builds the initial state before returning, then keeps it current in a background task.
-    pub async fn connect(config: AltCacheConfig) -> Result<Self> {
+    pub async fn connect(config: AltConfig) -> Result<Self> {
+        ensure!(!config.rpc.is_empty(), "at least one RPC URL is required");
         ensure!(
-            config.update_buffer_capacity > 0,
-            "update_buffer_capacity must be positive"
-        );
-        ensure!(
-            !config.bootstrap_urls.is_empty(),
-            "at least one bootstrap URL is required"
-        );
-        ensure!(
-            !config.yellowstone_sources.is_empty(),
+            !config.yellowstone_grpc.is_empty(),
             "at least one Yellowstone source is required"
         );
-        ensure!(
-            !config.yellowstone_idle_timeout.is_zero(),
-            "yellowstone_idle_timeout must be positive"
-        );
-        let mut bootstrap_urls = HashSet::new();
+        let mut rpc_urls = HashSet::new();
         ensure!(
             config
-                .bootstrap_urls
+                .rpc
                 .iter()
-                .all(|url| !url.is_empty() && bootstrap_urls.insert(url)),
-            "bootstrap URLs must be non-empty and unique"
+                .all(|url| !url.is_empty() && rpc_urls.insert(url)),
+            "RPC URLs must be non-empty and unique"
         );
         let mut yellowstone_urls = HashSet::new();
         ensure!(
             config
-                .yellowstone_sources
+                .yellowstone_grpc
                 .iter()
                 .all(|source| !source.url.is_empty() && yellowstone_urls.insert(&source.url)),
             "Yellowstone source URLs must be non-empty and unique"
@@ -187,7 +164,7 @@ struct Session {
 
 async fn run(
     http: reqwest::Client,
-    config: AltCacheConfig,
+    config: AltConfig,
     mut session: Session,
     tables: Arc<ArcSwap<DashMap<Address, AddressLookupTableAccount>>>,
     ready: Arc<AtomicBool>,
@@ -199,7 +176,7 @@ async fn run(
             &mut session,
             &confirmed_slot,
             &stop,
-            config.yellowstone_idle_timeout,
+            YELLOWSTONE_IDLE_TIMEOUT,
         )
         .await;
         if stop.is_cancelled() {
@@ -211,7 +188,7 @@ async fn run(
             error = ?result.err(),
             "ALT client Yellowstone feed disconnected"
         );
-        let next_source = (session.source_index + 1) % config.yellowstone_sources.len();
+        let next_source = (session.source_index + 1) % config.yellowstone_grpc.len();
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return,
@@ -233,12 +210,12 @@ async fn run(
 
 async fn recover(
     http: &reqwest::Client,
-    config: &AltCacheConfig,
+    config: &AltConfig,
     first_source: usize,
 ) -> Result<Session> {
     let mut last_error = None;
-    for offset in 0..config.yellowstone_sources.len() {
-        let source_index = (first_source + offset) % config.yellowstone_sources.len();
+    for offset in 0..config.yellowstone_grpc.len() {
+        let source_index = (first_source + offset) % config.yellowstone_grpc.len();
         match recover_from_source(http, config, source_index).await {
             Ok(session) => return Ok(session),
             Err(error) => {
@@ -256,10 +233,10 @@ async fn recover(
 
 async fn recover_from_source(
     http: &reqwest::Client,
-    config: &AltCacheConfig,
+    config: &AltConfig,
     source_index: usize,
 ) -> Result<Session> {
-    let source = &config.yellowstone_sources[source_index];
+    let source = &config.yellowstone_grpc[source_index];
     let mut grpc = yellowstone::connect(&source.url, source.token.as_deref()).await?;
     let (requests, receiver) = mpsc::channel(8);
     requests.send(yellowstone::subscribe_request()).await?;
@@ -268,9 +245,9 @@ async fn recover_from_source(
         .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
         .await?
         .into_inner();
-    let snapshot = fetch_snapshot_from_any(http, &config.bootstrap_urls);
+    let snapshot = fetch_snapshot_from_any(http, &config.rpc);
     tokio::pin!(snapshot);
-    let mut buffered = VecDeque::with_capacity(config.update_buffer_capacity.min(4_096));
+    let mut buffered = VecDeque::with_capacity(UPDATE_BUFFER_CAPACITY);
     let (slot, tables) = loop {
         tokio::select! {
             snapshot = &mut snapshot => break snapshot?,
@@ -280,7 +257,7 @@ async fn recover_from_source(
                     Some(UpdateOneof::Ping(_)) => yellowstone::send_ping(&requests)?,
                     Some(UpdateOneof::Account(update)) => {
                         ensure!(
-                            buffered.len() < config.update_buffer_capacity,
+                            buffered.len() < UPDATE_BUFFER_CAPACITY,
                             "ALT client bootstrap update buffer full"
                         );
                         buffered.push_back(BufferedEvent::Account(update));
@@ -289,7 +266,7 @@ async fn recover_from_source(
                         if update.status == SlotStatus::SlotConfirmed as i32 =>
                     {
                         ensure!(
-                            buffered.len() < config.update_buffer_capacity,
+                            buffered.len() < UPDATE_BUFFER_CAPACITY,
                             "ALT client bootstrap update buffer full"
                         );
                         buffered.push_back(BufferedEvent::ConfirmedSlot(update.slot));
@@ -540,15 +517,39 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_multiple_bootstrap_urls() {
-        let config = AltCacheConfig::new(
-            ["http://primary", "http://secondary"],
-            vec![YellowstoneSourceConfig::new("https://yellowstone")],
-        );
-        assert_eq!(
-            config.bootstrap_urls,
-            vec!["http://primary", "http://secondary"]
-        );
+    fn config_accepts_multiple_rpc_urls() {
+        let config = AltConfig {
+            rpc: vec!["http://primary".into(), "http://secondary".into()],
+            yellowstone_grpc: vec![YellowstoneGrpcConfig {
+                url: "https://yellowstone".into(),
+                token: Some("token".into()),
+            }],
+        };
+        assert_eq!(config.rpc, vec!["http://primary", "http://secondary"]);
+        assert_eq!(config.yellowstone_grpc[0].url, "https://yellowstone");
+        assert_eq!(config.yellowstone_grpc[0].token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn alt_config_deserializes() {
+        let config: AltConfig = toml::from_str(
+            r#"
+                rpc = ["http://primary", "http://secondary"]
+
+                [[yellowstone_grpc]]
+                url = "https://yellowstone-primary"
+                token = "secret"
+
+                [[yellowstone_grpc]]
+                url = "https://yellowstone-secondary"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.rpc.len(), 2);
+        assert_eq!(config.yellowstone_grpc.len(), 2);
+        assert_eq!(config.yellowstone_grpc[0].token.as_deref(), Some("secret"));
+        assert_eq!(config.yellowstone_grpc[1].token, None);
     }
 
     #[tokio::test]

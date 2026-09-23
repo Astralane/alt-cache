@@ -6,4 +6,4 @@ pub mod store;
 pub mod updater;
 pub mod yellowstone;
 
-pub use client::{AltCache, AltCacheConfig, YellowstoneSourceConfig};
+pub use client::{AltCache, AltConfig, YellowstoneGrpcConfig};

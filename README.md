@@ -73,24 +73,34 @@ returns a valid snapshot. Yellowstone sources are also tried in configuration
 order and rotated after a failure. Recovery builds a fresh map and atomically
 replaces the active map.
 
+```toml
+[alt_cache]
+rpc = [
+    "http://alt-cache-primary:8090",
+    "http://alt-cache-secondary:8090",
+]
+
+[[alt_cache.yellowstone_grpc]]
+url = "https://yellowstone-primary.example.com"
+token = "primary-token"
+
+[[alt_cache.yellowstone_grpc]]
+url = "https://yellowstone-secondary.example.com"
+token = "secondary-token"
+```
+
 ```rust
-use astralane_alt_cache::{AltCache, AltCacheConfig, YellowstoneSourceConfig};
+use astralane_alt_cache::{AltCache, AltConfig};
+use serde::Deserialize;
 use solana_address::Address;
 
-let config = AltCacheConfig::new(
-    [
-        "http://alt-cache-primary:8090",
-        "http://alt-cache-secondary:8090",
-    ],
-    vec![
-        YellowstoneSourceConfig::new("https://yellowstone-primary.example.com")
-            .with_token(primary_token),
-        YellowstoneSourceConfig::new("https://yellowstone-secondary.example.com")
-            .with_token(secondary_token),
-    ],
-);
+#[derive(Deserialize)]
+struct AppConfig {
+    alt_cache: AltConfig,
+}
 
-let cache = AltCache::connect(config).await?;
+let config: AppConfig = toml::from_str(&config_file)?;
+let cache = AltCache::connect(config.alt_cache).await?;
 let key: Address = "ALT_ADDRESS".parse()?;
 let table: Option<solana_message::AddressLookupTableAccount> = cache.get(&key)?;
 ```
