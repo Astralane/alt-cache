@@ -64,14 +64,14 @@ No validator process or Agave runtime is embedded.
 
 ## Library
 
-`AltCache` bootstraps from this service's `getProgramAccounts` JSON-RPC method,
-then maintains a process-local `Arc<DashMap<...>>` from one active Yellowstone
-stream. The stream is opened before the snapshot request and account and
-confirmed-slot updates are buffered during the fetch, so the snapshot-to-live
-handoff has no gap. Bootstrap URLs are tried in configuration order until one
-returns a valid snapshot. Yellowstone sources are also tried in configuration
-order and rotated after a failure. Recovery builds a fresh map and atomically
-replaces the active map.
+`AltCache` bootstraps from this service's paginated `getProgramAccountsV2`
+JSON-RPC method using `base64+zstd`, decoding each page directly into its
+process-local `Arc<DashMap<...>>`. The stream is opened before the snapshot
+request and account and confirmed-slot updates are buffered during the fetch,
+so the snapshot-to-live handoff has no gap. Bootstrap URLs are tried in
+configuration order until one returns a valid snapshot. Yellowstone sources
+are also tried in configuration order and rotated after a failure. Recovery
+builds a fresh map and atomically replaces the active map.
 
 ```toml
 [alt_cache]
@@ -144,6 +144,8 @@ client is paging.
 ## Operations
 
 - `getHealth`: reports readiness and the active source.
+- `max_snapshot_page_size` controls the largest accepted
+  `getProgramAccountsV2` page and defaults to 100,000 accounts.
 - The bootstrap completion log reports accumulated response size, fetch time,
   JSON deserialization time, ALT account decoding time, and total snapshot time.
 - Each Yellowstone source, the state updater, and each inbound network service

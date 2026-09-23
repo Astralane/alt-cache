@@ -2,6 +2,7 @@ http_addr = "127.0.0.1:8090"
 yellowstone_idle_timeout_secs = 15
 full_refresh_interval_secs = 3600
 stream_capacity = 4096
+max_snapshot_page_size = 100000
 
 # [alerts.slack]
 # url_env = "ALT_CACHE_SLACK_WEBHOOK"

@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,7 @@ use yellowstone_grpc_proto::prelude::{
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const YELLOWSTONE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_BUFFER_CAPACITY: usize = 4_096;
+const SNAPSHOT_PAGE_SIZE: usize = 100_000;
 
 /// Bootstrap and live-source endpoints used to initialize an ALT cache.
 #[derive(Deserialize)]
@@ -347,7 +348,14 @@ struct RpcError {
 #[derive(Deserialize)]
 struct SnapshotResponse {
     context: SnapshotContext,
-    value: Vec<KeyedUiAccount>,
+    value: SnapshotPage,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotPage {
+    accounts: Vec<KeyedUiAccount>,
+    pagination_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -359,44 +367,85 @@ async fn fetch_snapshot(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
-    let response = http
-        .post(url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getProgramAccounts",
-            "params": [program_id(), {"commitment":"confirmed", "encoding":"base64", "withContext":true}]
-        }))
-        .send()
-        .await
-        .map_err(redact_rpc_error)?
-        .error_for_status()
-        .map_err(redact_rpc_error)?;
-    let body = response.bytes().await.map_err(redact_rpc_error)?;
-    let response: RpcResponse<SnapshotResponse> = serde_json::from_slice(&body)?;
-    if let Some(error) = response.error {
-        anyhow::bail!("snapshot RPC error {}: {}", error.code, error.message);
-    }
-    let snapshot = response.result.context("snapshot RPC result missing")?;
-    let tables = Arc::new(DashMap::with_capacity(snapshot.value.len()));
-    for entry in snapshot.value {
-        let key = Address::from(parse_key(&entry.pubkey)?);
-        let data = entry
-            .account
-            .data
-            .decode()
-            .context("invalid ALT account data")?;
-        let table = AddressLookupTable::deserialize(&data)
-            .map_err(|_| anyhow::anyhow!("invalid ALT account"))?;
-        tables.insert(
-            key,
-            AddressLookupTableAccount {
-                key,
-                addresses: table.addresses.into_owned(),
-            },
+    let started = Instant::now();
+    let tables = Arc::new(DashMap::with_capacity(SNAPSHOT_PAGE_SIZE));
+    let mut snapshot_slot = None;
+    let mut pagination_key: Option<String> = None;
+    let mut seen = HashSet::new();
+    let mut pages = 0_u64;
+    let mut response_bytes = 0_u64;
+    loop {
+        let response = http
+            .post(url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getProgramAccountsV2",
+                "params": [program_id(), {
+                    "commitment": "confirmed",
+                    "encoding": "base64+zstd",
+                    "withContext": true,
+                    "limit": SNAPSHOT_PAGE_SIZE,
+                    "paginationKey": pagination_key.as_deref(),
+                }]
+            }))
+            .send()
+            .await
+            .map_err(redact_rpc_error)?
+            .error_for_status()
+            .map_err(redact_rpc_error)?;
+        let body = response.bytes().await.map_err(redact_rpc_error)?;
+        pages += 1;
+        response_bytes += body.len() as u64;
+        let response: RpcResponse<SnapshotResponse> = serde_json::from_slice(&body)?;
+        drop(body);
+        if let Some(error) = response.error {
+            anyhow::bail!("snapshot RPC error {}: {}", error.code, error.message);
+        }
+        let snapshot = response.result.context("snapshot RPC result missing")?;
+        let slot = snapshot.context.slot;
+        let first_slot = *snapshot_slot.get_or_insert(slot);
+        ensure!(
+            slot == first_slot,
+            "snapshot slot changed from {first_slot} to {slot}"
         );
+        let page = snapshot.value;
+        for entry in page.accounts {
+            let key = Address::from(parse_key(&entry.pubkey)?);
+            let data = entry
+                .account
+                .data
+                .decode()
+                .context("invalid ALT account data")?;
+            let table = AddressLookupTable::deserialize(&data)
+                .map_err(|_| anyhow::anyhow!("invalid ALT account"))?;
+            tables.insert(
+                key,
+                AddressLookupTableAccount {
+                    key,
+                    addresses: table.addresses.into_owned(),
+                },
+            );
+        }
+        let Some(next) = page.pagination_key else {
+            break;
+        };
+        ensure!(
+            seen.insert(next.clone()),
+            "snapshot RPC repeated its pagination key"
+        );
+        pagination_key = Some(next);
     }
-    Ok((snapshot.context.slot, tables))
+    let snapshot_slot = snapshot_slot.context("snapshot RPC context missing")?;
+    tracing::info!(
+        snapshot_slot,
+        pages,
+        accounts = tables.len(),
+        response_bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ALT client snapshot fetched"
+    );
+    Ok((snapshot_slot, tables))
 }
 
 async fn fetch_snapshot_from_any(
@@ -557,16 +606,33 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let bytes_read = socket.read(&mut request).await.unwrap();
-            assert!(bytes_read > 0);
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":42},"value":[]}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
+            for (page, next) in [Some("next"), None].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let bytes_read = socket.read(&mut request).await.unwrap();
+                assert!(bytes_read > 0);
+                let request = String::from_utf8_lossy(&request[..bytes_read]);
+                assert!(request.contains("getProgramAccountsV2"));
+                assert!(request.contains("base64+zstd"));
+                assert!(request.contains("100000"));
+                if page == 1 {
+                    assert!(request.contains(r#""paginationKey":"next""#));
+                }
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 42},
+                        "value": {"accounts": [], "paginationKey": next},
+                    },
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
         });
         let urls = vec!["not a URL".to_owned(), format!("http://{address}")];
         let http = reqwest::Client::new();

@@ -68,10 +68,11 @@ fn main() -> Result<()> {
         let store = store.clone();
         let stop = stop.clone();
         let addr = config.http_addr;
+        let max_page_size = config.max_snapshot_page_size;
         spawn_service(
             "alt-json-rpc",
             stop.clone(),
-            api::serve_json(addr, store, stop),
+            api::serve_json(addr, store, max_page_size, stop),
         )?;
     }
 

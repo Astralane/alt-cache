@@ -85,6 +85,7 @@ trait AltJsonRpc {
 
 struct JsonRpc {
     store: Arc<Store>,
+    max_page_size: usize,
 }
 
 impl AltJsonRpcServer for JsonRpc {
@@ -99,7 +100,7 @@ impl AltJsonRpcServer for JsonRpc {
     ) -> RpcResult<ProgramAccountsResponse> {
         validate_program(&address)?;
         let config = config.unwrap_or_default();
-        validate_config(&config, false)?;
+        validate_config(&config, false, self.max_page_size)?;
         let snapshot = self.store.read_snapshot().map_err(|_| unavailable())?;
         validate_min_context_slot(&config, snapshot.slot)?;
         let accounts = encode_accounts(snapshot.accounts.values(), &config)?;
@@ -122,7 +123,7 @@ impl AltJsonRpcServer for JsonRpc {
     ) -> RpcResult<ProgramAccountsV2Response> {
         validate_program(&address)?;
         let config = config.unwrap_or_default();
-        validate_config(&config, true)?;
+        validate_config(&config, true, self.max_page_size)?;
         let limit = config.limit.unwrap_or(1_000);
         let cursor = config
             .pagination_key
@@ -174,7 +175,11 @@ fn validate_program(address: &str) -> RpcResult<()> {
     Ok(())
 }
 
-fn validate_config(config: &ProgramAccountsConfig, paginated: bool) -> RpcResult<()> {
+fn validate_config(
+    config: &ProgramAccountsConfig,
+    paginated: bool,
+    max_page_size: usize,
+) -> RpcResult<()> {
     if config
         .commitment
         .as_deref()
@@ -197,8 +202,8 @@ fn validate_config(config: &ProgramAccountsConfig, paginated: bool) -> RpcResult
             "limit and paginationKey require getProgramAccountsV2",
         ));
     }
-    if paginated && !matches!(config.limit.unwrap_or(1_000), 1..=10_000) {
-        return Err(invalid_params("limit must be between 1 and 10000"));
+    if paginated && !(1..=max_page_size).contains(&config.limit.unwrap_or(1_000)) {
+        return Err(invalid_params("limit exceeds the configured maximum"));
     }
     if matches!(config.encoding, Some(UiAccountEncoding::JsonParsed)) {
         return Err(invalid_params("jsonParsed encoding is unsupported"));
@@ -242,11 +247,20 @@ fn format_cursor(slot: u64, key: [u8; 32]) -> String {
     format!("{slot}:{}", bs58::encode(key).into_string())
 }
 
-fn json_rpc(store: Arc<Store>) -> jsonrpsee::RpcModule<JsonRpc> {
-    JsonRpc { store }.into_rpc()
+fn json_rpc(store: Arc<Store>, max_page_size: usize) -> jsonrpsee::RpcModule<JsonRpc> {
+    JsonRpc {
+        store,
+        max_page_size,
+    }
+    .into_rpc()
 }
 
-pub async fn serve(addr: SocketAddr, store: Arc<Store>, stop: CancellationToken) -> AnyResult<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    store: Arc<Store>,
+    max_page_size: usize,
+    stop: CancellationToken,
+) -> AnyResult<()> {
     let config = ServerConfig::builder()
         .http_only()
         .max_connections(16)
@@ -254,7 +268,7 @@ pub async fn serve(addr: SocketAddr, store: Arc<Store>, stop: CancellationToken)
         .max_response_body_size(u32::MAX)
         .build();
     let server = ServerBuilder::with_config(config).build(addr).await?;
-    let handle = server.start(json_rpc(store));
+    let handle = server.start(json_rpc(store, max_page_size));
     tokio::select! {
         _ = stop.cancelled() => {
             let _ = handle.stop();
@@ -284,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn health_tracks_invalidation() {
         let (store, mut updater) = store();
-        let rpc = json_rpc(store);
+        let rpc = json_rpc(store, 100_000);
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}"#;
         let (response, _) = rpc.raw_json_request(request, 1).await.unwrap();
         let response: Value = serde_json::from_str(response.get()).unwrap();
@@ -321,7 +335,7 @@ mod tests {
                 .unwrap();
         }
         updater.confirm(4);
-        let rpc = json_rpc(store);
+        let rpc = json_rpc(store, 100_000);
         let program = program_id();
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"getProgramAccounts","params":["{program}"]}}"#

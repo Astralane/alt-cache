@@ -14,6 +14,8 @@ pub struct Config {
     pub full_refresh_interval_secs: u64,
     #[serde(default = "capacity")]
     pub stream_capacity: usize,
+    #[serde(default = "max_snapshot_page_size")]
+    pub max_snapshot_page_size: usize,
     #[serde(default)]
     pub logging: Logging,
     #[serde(default)]
@@ -133,6 +135,9 @@ fn full_refresh_interval_seconds() -> u64 {
 fn capacity() -> usize {
     4096
 }
+fn max_snapshot_page_size() -> usize {
+    100_000
+}
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -140,6 +145,10 @@ impl Config {
             "at least one gRPC source is required"
         );
         ensure!(self.stream_capacity > 0, "stream_capacity must be positive");
+        ensure!(
+            self.max_snapshot_page_size > 0,
+            "max_snapshot_page_size must be positive"
+        );
         ensure!(
             self.yellowstone_idle_timeout_secs > 0,
             "yellowstone_idle_timeout_secs must be positive"
@@ -218,6 +227,7 @@ mod tests {
         );
         assert_eq!(c.grpc_sources.len(), 2);
         assert_eq!(c.stream_capacity, 4096);
+        assert_eq!(c.max_snapshot_page_size, 100_000);
     }
 
     #[test]
