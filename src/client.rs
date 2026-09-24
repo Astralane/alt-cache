@@ -29,7 +29,7 @@ use yellowstone_grpc_proto::prelude::{
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const SNAPSHOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const YELLOWSTONE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-const UPDATE_BUFFER_CAPACITY: usize = 4_096;
+const UPDATE_BUFFER_CAPACITY: usize = 16_384;
 
 /// Bootstrap and live-source endpoints used to initialize an ALT cache.
 #[derive(Deserialize)]
@@ -111,7 +111,7 @@ impl AltCache {
                 .all(|source| !source.url.is_empty() && yellowstone_urls.insert(&source.url)),
             "Yellowstone source URLs must be non-empty and unique"
         );
-        let session = recover(&config, 0).await?;
+        let session = establish_session(&config, 0).await?;
         let tables = Arc::new(ArcSwap::from(session.tables.clone()));
         let ready = Arc::new(AtomicBool::new(true));
         let confirmed_slot = Arc::new(AtomicU64::new(session.confirmed_slot));
@@ -185,7 +185,7 @@ async fn run(
                 _ = stop.cancelled() => return,
                 _ = tokio::time::sleep(RETRY_DELAY) => {}
             }
-            match recover(&config, next_source).await {
+            match establish_session(&config, next_source).await {
                 Ok(recovered) => {
                     tables.store(recovered.tables.clone());
                     confirmed_slot.store(recovered.confirmed_slot, Ordering::Release);
@@ -199,11 +199,11 @@ async fn run(
     }
 }
 
-async fn recover(config: &AltConfig, first_source: usize) -> Result<Session> {
+async fn establish_session(config: &AltConfig, start_source_index: usize) -> Result<Session> {
     let mut last_error = None;
     for offset in 0..config.yellowstone_grpc.len() {
-        let source_index = (first_source + offset) % config.yellowstone_grpc.len();
-        match recover_from_source(config, source_index).await {
+        let source_index = (start_source_index + offset) % config.yellowstone_grpc.len();
+        match establish_session_from_source(config, source_index).await {
             Ok(session) => return Ok(session),
             Err(error) => {
                 tracing::warn!(
@@ -218,7 +218,7 @@ async fn recover(config: &AltConfig, first_source: usize) -> Result<Session> {
     Err(last_error.context("all Yellowstone sources failed")?)
 }
 
-async fn recover_from_source(config: &AltConfig, source_index: usize) -> Result<Session> {
+async fn establish_session_from_source(config: &AltConfig, source_index: usize) -> Result<Session> {
     let source = &config.yellowstone_grpc[source_index];
     let mut grpc = yellowstone::connect(&source.url, source.token.as_deref()).await?;
     let (requests, receiver) = mpsc::channel(8);
