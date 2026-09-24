@@ -1,4 +1,5 @@
 http_addr = "127.0.0.1:8090"
+snapshot_grpc_addr = "127.0.0.1:8091"
 yellowstone_idle_timeout_secs = 15
 full_refresh_interval_secs = 3600
 stream_capacity = 4096

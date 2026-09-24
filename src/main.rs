@@ -75,10 +75,20 @@ fn main() -> Result<()> {
             api::serve_json(addr, store, max_page_size, stop),
         )?;
     }
+    {
+        let store = store.clone();
+        let stop = stop.clone();
+        let addr = config.snapshot_grpc_addr;
+        spawn_service(
+            "alt-snapshot-grpc",
+            stop.clone(),
+            api::serve_grpc(addr, store, stop),
+        )?;
+    }
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        service_threads = config.grpc_sources.len() + 2,
+        service_threads = config.grpc_sources.len() + 3,
         "ALT cache started"
     );
     wait_for_shutdown()?;

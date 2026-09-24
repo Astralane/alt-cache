@@ -10,7 +10,7 @@ Rust library and in-memory service, version **4.2.2**. Live account updates use
 2. Fetch one full confirmed snapshot while buffering active-source updates.
 3. Stage account updates by slot and publish them only after that slot is
    confirmed.
-4. Serve complete or paginated immutable confirmed snapshots.
+4. Serve immutable confirmed snapshots over binary gRPC streaming and JSON-RPC.
 
 The bootstrap RPC is independent of the gRPC sources. It must be Helius or a
 compatible provider implementing paginated `getProgramAccountsV2`. Every gRPC
@@ -64,20 +64,22 @@ No validator process or Agave runtime is embedded.
 
 ## Library
 
-`AltCache` bootstraps from this service's paginated `getProgramAccountsV2`
-JSON-RPC method using `base64+zstd`, decoding each page directly into its
-process-local `Arc<DashMap<...>>`. The stream is opened before the snapshot
-request and account and confirmed-slot updates are buffered during the fetch,
-so the snapshot-to-live handoff has no gap. Bootstrap URLs are tried in
-configuration order until one returns a valid snapshot. Yellowstone sources
-are also tried in configuration order and rotated after a failure. Recovery
-builds a fresh map and atomically replaces the active map.
+`AltCache` bootstraps from this service's server-streaming `StreamSnapshot`
+gRPC method. Each bounded protobuf chunk contains raw ALT public keys and
+account data from one immutable confirmed snapshot. The client decodes chunks
+directly into its process-local `Arc<DashMap<...>>` and verifies the slot and
+total account count before publishing the map. The Yellowstone stream is opened
+before the snapshot request and account and confirmed-slot updates are buffered
+during the fetch, so the snapshot-to-live handoff has no gap. Snapshot URLs are
+tried in configuration order until one returns a valid complete stream.
+Yellowstone sources are also tried in configuration order and rotated after a
+failure. Recovery builds a fresh map and atomically replaces the active map.
 
 ```toml
 [alt_cache]
-rpc = [
-    "http://alt-cache-primary:8090",
-    "http://alt-cache-secondary:8090",
+snapshot_grpc = [
+    "http://alt-cache-primary:8091",
+    "http://alt-cache-secondary:8091",
 ]
 
 [[alt_cache.yellowstone_grpc]]
@@ -110,6 +112,18 @@ have been installed. `get` returns an error while the local Yellowstone feed is
 recovering, `None` for a missing table, or Solana's standard
 `AddressLookupTableAccount`. Dropping the last clone of `AltCache` stops its
 background task.
+
+## Snapshot gRPC
+
+The binary snapshot service listens on `snapshot_grpc_addr`. Its
+`astralane.alt_cache.v1.AltSnapshot/StreamSnapshot` method captures the latest
+ready immutable snapshot once, then streams byte-size-bounded chunks. Live
+Yellowstone writes continue while that snapshot is being transferred. A stream
+already in progress remains valid if the live cache later enters recovery.
+
+The wire schema is in `proto/alt_snapshot.proto`. It is separate from the
+Yellowstone schema because it describes this cache's downstream snapshot API,
+not the upstream Geyser subscription.
 
 ## JSON-RPC
 
@@ -144,6 +158,8 @@ client is paging.
 ## Operations
 
 - `getHealth`: reports readiness and the active source.
+- `http_addr` serves JSON-RPC and `snapshot_grpc_addr` serves the binary gRPC
+  snapshot stream. They must be different addresses.
 - `max_snapshot_page_size` controls the largest accepted
   `getProgramAccountsV2` page and defaults to 100,000 accounts.
 - The bootstrap completion log reports accumulated response size, fetch time,

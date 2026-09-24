@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package astralane.alt_cache.v1;
+
+service AltSnapshot {
+  rpc StreamSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+}
+
+message SnapshotRequest {}
+
+message SnapshotChunk {
+  uint64 confirmed_slot = 1;
+  uint64 total_accounts = 2;
+  repeated AltAccount accounts = 3;
+}
+
+message AltAccount {
+  bytes pubkey = 1;
+  bytes data = 2;
+}

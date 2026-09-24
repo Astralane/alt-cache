@@ -6,6 +6,7 @@ use std::{net::SocketAddr, path::PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub http_addr: SocketAddr,
+    pub snapshot_grpc_addr: SocketAddr,
     pub bootstrap_rpc: BootstrapRpc,
     pub grpc_sources: Vec<GrpcSource>,
     #[serde(default = "yellowstone_idle_timeout_seconds")]
@@ -140,6 +141,10 @@ fn max_snapshot_page_size() -> usize {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.http_addr != self.snapshot_grpc_addr,
+            "http_addr and snapshot_grpc_addr must be different"
+        );
         ensure!(
             !self.grpc_sources.is_empty(),
             "at least one gRPC source is required"

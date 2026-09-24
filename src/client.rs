@@ -1,5 +1,5 @@
 use crate::{
-    store::{KeyedUiAccount, parse_key, program_id},
+    proto::{SnapshotRequest, alt_snapshot_client::AltSnapshotClient},
     yellowstone,
 };
 use anyhow::{Context, Result, ensure};
@@ -7,7 +7,6 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
 use solana_address::Address;
 use solana_address_lookup_table_interface::{program, state::AddressLookupTable};
 use solana_message::AddressLookupTableAccount;
@@ -21,22 +20,22 @@ use std::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tonic::Streaming;
+use tonic::{Streaming, transport::Endpoint};
 use yellowstone_grpc_proto::prelude::{
     SlotStatus, SubscribeRequest, SubscribeUpdate, SubscribeUpdateAccount,
     subscribe_update::UpdateOneof,
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const SNAPSHOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const YELLOWSTONE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_BUFFER_CAPACITY: usize = 4_096;
-const SNAPSHOT_PAGE_SIZE: usize = 100_000;
 
 /// Bootstrap and live-source endpoints used to initialize an ALT cache.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AltConfig {
-    pub rpc: Vec<String>,
+    pub snapshot_grpc: Vec<String>,
     pub yellowstone_grpc: Vec<YellowstoneGrpcConfig>,
 }
 
@@ -88,18 +87,21 @@ impl Drop for Inner {
 impl AltCache {
     /// Builds the initial state before returning, then keeps it current in a background task.
     pub async fn connect(config: AltConfig) -> Result<Self> {
-        ensure!(!config.rpc.is_empty(), "at least one RPC URL is required");
+        ensure!(
+            !config.snapshot_grpc.is_empty(),
+            "at least one snapshot gRPC URL is required"
+        );
         ensure!(
             !config.yellowstone_grpc.is_empty(),
             "at least one Yellowstone source is required"
         );
-        let mut rpc_urls = HashSet::new();
+        let mut snapshot_urls = HashSet::new();
         ensure!(
             config
-                .rpc
+                .snapshot_grpc
                 .iter()
-                .all(|url| !url.is_empty() && rpc_urls.insert(url)),
-            "RPC URLs must be non-empty and unique"
+                .all(|url| !url.is_empty() && snapshot_urls.insert(url)),
+            "snapshot gRPC URLs must be non-empty and unique"
         );
         let mut yellowstone_urls = HashSet::new();
         ensure!(
@@ -109,10 +111,7 @@ impl AltCache {
                 .all(|source| !source.url.is_empty() && yellowstone_urls.insert(&source.url)),
             "Yellowstone source URLs must be non-empty and unique"
         );
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()?;
-        let session = recover(&http, &config, 0).await?;
+        let session = recover(&config, 0).await?;
         let tables = Arc::new(ArcSwap::from(session.tables.clone()));
         let ready = Arc::new(AtomicBool::new(true));
         let confirmed_slot = Arc::new(AtomicU64::new(session.confirmed_slot));
@@ -124,15 +123,7 @@ impl AltCache {
             stop: stop.clone(),
             task: Mutex::new(None),
         });
-        let task = tokio::spawn(run(
-            http,
-            config,
-            session,
-            tables,
-            ready,
-            confirmed_slot,
-            stop,
-        ));
+        let task = tokio::spawn(run(config, session, tables, ready, confirmed_slot, stop));
         *inner.task.lock().unwrap() = Some(task);
         Ok(Self { inner })
     }
@@ -164,7 +155,6 @@ struct Session {
 }
 
 async fn run(
-    http: reqwest::Client,
     config: AltConfig,
     mut session: Session,
     tables: Arc<ArcSwap<DashMap<Address, AddressLookupTableAccount>>>,
@@ -195,7 +185,7 @@ async fn run(
                 _ = stop.cancelled() => return,
                 _ = tokio::time::sleep(RETRY_DELAY) => {}
             }
-            match recover(&http, &config, next_source).await {
+            match recover(&config, next_source).await {
                 Ok(recovered) => {
                     tables.store(recovered.tables.clone());
                     confirmed_slot.store(recovered.confirmed_slot, Ordering::Release);
@@ -209,15 +199,11 @@ async fn run(
     }
 }
 
-async fn recover(
-    http: &reqwest::Client,
-    config: &AltConfig,
-    first_source: usize,
-) -> Result<Session> {
+async fn recover(config: &AltConfig, first_source: usize) -> Result<Session> {
     let mut last_error = None;
     for offset in 0..config.yellowstone_grpc.len() {
         let source_index = (first_source + offset) % config.yellowstone_grpc.len();
-        match recover_from_source(http, config, source_index).await {
+        match recover_from_source(config, source_index).await {
             Ok(session) => return Ok(session),
             Err(error) => {
                 tracing::warn!(
@@ -232,11 +218,7 @@ async fn recover(
     Err(last_error.context("all Yellowstone sources failed")?)
 }
 
-async fn recover_from_source(
-    http: &reqwest::Client,
-    config: &AltConfig,
-    source_index: usize,
-) -> Result<Session> {
+async fn recover_from_source(config: &AltConfig, source_index: usize) -> Result<Session> {
     let source = &config.yellowstone_grpc[source_index];
     let mut grpc = yellowstone::connect(&source.url, source.token.as_deref()).await?;
     let (requests, receiver) = mpsc::channel(8);
@@ -246,7 +228,7 @@ async fn recover_from_source(
         .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
         .await?
         .into_inner();
-    let snapshot = fetch_snapshot_from_any(http, &config.rpc);
+    let snapshot = fetch_snapshot_from_any(&config.snapshot_grpc);
     tokio::pin!(snapshot);
     let mut buffered = VecDeque::with_capacity(UPDATE_BUFFER_CAPACITY);
     let (slot, tables) = loop {
@@ -333,91 +315,75 @@ async fn follow(
     }
 }
 
-#[derive(Deserialize)]
-struct RpcResponse<T> {
-    result: Option<T>,
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct SnapshotResponse {
-    context: SnapshotContext,
-    value: SnapshotPage,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnapshotPage {
-    accounts: Vec<KeyedUiAccount>,
-    pagination_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SnapshotContext {
-    slot: u64,
-}
-
 async fn fetch_snapshot(
-    http: &reqwest::Client,
     url: &str,
 ) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
     let started = Instant::now();
-    let tables = Arc::new(DashMap::with_capacity(SNAPSHOT_PAGE_SIZE));
-    let mut snapshot_slot = None;
-    let mut pagination_key: Option<String> = None;
-    let mut seen = HashSet::new();
-    let mut pages = 0_u64;
-    let mut response_bytes = 0_u64;
-    loop {
-        let response = http
-            .post(url)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getProgramAccountsV2",
-                "params": [program_id(), {
-                    "commitment": "confirmed",
-                    "encoding": "base64+zstd",
-                    "withContext": true,
-                    "limit": SNAPSHOT_PAGE_SIZE,
-                    "paginationKey": pagination_key.as_deref(),
-                }]
-            }))
-            .send()
-            .await
-            .map_err(redact_rpc_error)?
-            .error_for_status()
-            .map_err(redact_rpc_error)?;
-        let body = response.bytes().await.map_err(redact_rpc_error)?;
-        pages += 1;
-        response_bytes += body.len() as u64;
-        let response: RpcResponse<SnapshotResponse> = serde_json::from_slice(&body)?;
-        drop(body);
-        if let Some(error) = response.error {
-            anyhow::bail!("snapshot RPC error {}: {}", error.code, error.message);
-        }
-        let snapshot = response.result.context("snapshot RPC result missing")?;
-        let slot = snapshot.context.slot;
-        let first_slot = *snapshot_slot.get_or_insert(slot);
+    let channel = Endpoint::from_shared(url.to_owned())?
+        .connect_timeout(SNAPSHOT_CONNECT_TIMEOUT)
+        .http2_adaptive_window(true)
+        .connect()
+        .await?;
+    let mut client = AltSnapshotClient::new(channel);
+    let mut stream = client
+        .stream_snapshot(SnapshotRequest {})
+        .await?
+        .into_inner();
+    let mut download = SnapshotDownload::default();
+    while let Some(chunk) = stream.message().await? {
+        download.push(chunk)?;
+    }
+    let snapshot = download.finish()?;
+    tracing::info!(
+        snapshot_slot = snapshot.slot,
+        chunks = snapshot.chunks,
+        accounts = snapshot.tables.len(),
+        payload_bytes = snapshot.payload_bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ALT client snapshot fetched"
+    );
+    Ok((snapshot.slot, snapshot.tables))
+}
+
+#[derive(Default)]
+struct SnapshotDownload {
+    slot: Option<u64>,
+    total_accounts: Option<u64>,
+    tables: Option<Arc<DashMap<Address, AddressLookupTableAccount>>>,
+    chunks: u64,
+    payload_bytes: u64,
+}
+
+struct CompletedSnapshot {
+    slot: u64,
+    tables: Arc<DashMap<Address, AddressLookupTableAccount>>,
+    chunks: u64,
+    payload_bytes: u64,
+}
+
+impl SnapshotDownload {
+    fn push(&mut self, chunk: crate::proto::SnapshotChunk) -> Result<()> {
+        self.chunks += 1;
+        let first_slot = *self.slot.get_or_insert(chunk.confirmed_slot);
         ensure!(
-            slot == first_slot,
-            "snapshot slot changed from {first_slot} to {slot}"
+            chunk.confirmed_slot == first_slot,
+            "snapshot slot changed from {first_slot} to {}",
+            chunk.confirmed_slot
         );
-        let page = snapshot.value;
-        for entry in page.accounts {
-            let key = Address::from(parse_key(&entry.pubkey)?);
-            let data = entry
-                .account
-                .data
-                .decode()
-                .context("invalid ALT account data")?;
-            let table = AddressLookupTable::deserialize(&data)
+        let expected_accounts = *self.total_accounts.get_or_insert(chunk.total_accounts);
+        ensure!(
+            chunk.total_accounts == expected_accounts,
+            "snapshot account count changed from {expected_accounts} to {}",
+            chunk.total_accounts
+        );
+        let capacity = usize::try_from(expected_accounts).context("snapshot is too large")?;
+        let tables = self
+            .tables
+            .get_or_insert_with(|| Arc::new(DashMap::with_capacity(capacity)));
+        for account in chunk.accounts {
+            self.payload_bytes += (account.pubkey.len() + account.data.len()) as u64;
+            let key = Address::try_from(account.pubkey.as_slice())?;
+            let table = AddressLookupTable::deserialize(&account.data)
                 .map_err(|_| anyhow::anyhow!("invalid ALT account"))?;
             tables.insert(
                 key,
@@ -427,34 +393,33 @@ async fn fetch_snapshot(
                 },
             );
         }
-        let Some(next) = page.pagination_key else {
-            break;
-        };
-        ensure!(
-            seen.insert(next.clone()),
-            "snapshot RPC repeated its pagination key"
-        );
-        pagination_key = Some(next);
+        Ok(())
     }
-    let snapshot_slot = snapshot_slot.context("snapshot RPC context missing")?;
-    tracing::info!(
-        snapshot_slot,
-        pages,
-        accounts = tables.len(),
-        response_bytes,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "ALT client snapshot fetched"
-    );
-    Ok((snapshot_slot, tables))
+
+    fn finish(self) -> Result<CompletedSnapshot> {
+        let slot = self.slot.context("snapshot gRPC stream was empty")?;
+        let total_accounts = self.total_accounts.unwrap();
+        let tables = self.tables.unwrap();
+        ensure!(
+            tables.len() as u64 == total_accounts,
+            "snapshot ended after {} of {total_accounts} accounts",
+            tables.len()
+        );
+        Ok(CompletedSnapshot {
+            slot,
+            tables,
+            chunks: self.chunks,
+            payload_bytes: self.payload_bytes,
+        })
+    }
 }
 
 async fn fetch_snapshot_from_any(
-    http: &reqwest::Client,
     urls: &[String],
 ) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
     let mut last_error = None;
     for (index, url) in urls.iter().enumerate() {
-        match fetch_snapshot(http, url).await {
+        match fetch_snapshot(url).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => {
                 tracing::warn!(
@@ -466,11 +431,7 @@ async fn fetch_snapshot_from_any(
             }
         }
     }
-    Err(last_error.context("all bootstrap URLs failed")?)
-}
-
-fn redact_rpc_error(error: reqwest::Error) -> anyhow::Error {
-    anyhow::Error::new(error.without_url())
+    Err(last_error.context("all snapshot gRPC URLs failed")?)
 }
 
 fn apply_update(
@@ -537,11 +498,8 @@ fn apply_pending_through(session: &mut Session, slot: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{AltAccount, SnapshotChunk};
     use solana_address_lookup_table_interface::state::LookupTableMeta;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
     fn account_update(key: Address, lamports: u64) -> SubscribeUpdateAccount {
@@ -566,15 +524,18 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_multiple_rpc_urls() {
+    fn config_accepts_multiple_snapshot_urls() {
         let config = AltConfig {
-            rpc: vec!["http://primary".into(), "http://secondary".into()],
+            snapshot_grpc: vec!["http://primary".into(), "http://secondary".into()],
             yellowstone_grpc: vec![YellowstoneGrpcConfig {
                 url: "https://yellowstone".into(),
                 token: Some("token".into()),
             }],
         };
-        assert_eq!(config.rpc, vec!["http://primary", "http://secondary"]);
+        assert_eq!(
+            config.snapshot_grpc,
+            vec!["http://primary", "http://secondary"]
+        );
         assert_eq!(config.yellowstone_grpc[0].url, "https://yellowstone");
         assert_eq!(config.yellowstone_grpc[0].token.as_deref(), Some("token"));
     }
@@ -583,7 +544,7 @@ mod tests {
     fn alt_config_deserializes() {
         let config: AltConfig = toml::from_str(
             r#"
-                rpc = ["http://primary", "http://secondary"]
+                snapshot_grpc = ["http://primary", "http://secondary"]
 
                 [[yellowstone_grpc]]
                 url = "https://yellowstone-primary"
@@ -595,53 +556,40 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.rpc.len(), 2);
+        assert_eq!(config.snapshot_grpc.len(), 2);
         assert_eq!(config.yellowstone_grpc.len(), 2);
         assert_eq!(config.yellowstone_grpc[0].token.as_deref(), Some("secret"));
         assert_eq!(config.yellowstone_grpc[1].token, None);
     }
 
-    #[tokio::test]
-    async fn snapshot_falls_back_to_next_bootstrap_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for (page, next) in [Some("next"), None].into_iter().enumerate() {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 4096];
-                let bytes_read = socket.read(&mut request).await.unwrap();
-                assert!(bytes_read > 0);
-                let request = String::from_utf8_lossy(&request[..bytes_read]);
-                assert!(request.contains("getProgramAccountsV2"));
-                assert!(request.contains("base64+zstd"));
-                assert!(request.contains("100000"));
-                if page == 1 {
-                    assert!(request.contains(r#""paginationKey":"next""#));
-                }
-                let body = json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "context": {"slot": 42},
-                        "value": {"accounts": [], "paginationKey": next},
-                    },
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let urls = vec!["not a URL".to_owned(), format!("http://{address}")];
-        let http = reqwest::Client::new();
-
-        let (slot, tables) = fetch_snapshot_from_any(&http, &urls).await.unwrap();
-
-        assert_eq!(slot, 42);
-        assert!(tables.is_empty());
-        server.await.unwrap();
+    #[test]
+    fn snapshot_download_decodes_and_validates_the_stream() {
+        let table = AddressLookupTable {
+            meta: LookupTableMeta::default(),
+            addresses: std::borrow::Cow::Owned(vec![Address::from([9; 32])]),
+        };
+        let mut download = SnapshotDownload::default();
+        download
+            .push(SnapshotChunk {
+                confirmed_slot: 42,
+                total_accounts: 1,
+                accounts: vec![AltAccount {
+                    pubkey: vec![1; 32],
+                    data: table.serialize_for_tests().unwrap(),
+                }],
+            })
+            .unwrap();
+        let snapshot = download.finish().unwrap();
+        assert_eq!(snapshot.slot, 42);
+        assert_eq!(snapshot.chunks, 1);
+        assert_eq!(
+            snapshot
+                .tables
+                .get(&Address::from([1; 32]))
+                .unwrap()
+                .addresses,
+            vec![Address::from([9; 32])]
+        );
     }
 
     #[test]
