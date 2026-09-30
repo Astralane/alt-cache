@@ -110,8 +110,11 @@ let table: Option<solana_message::AddressLookupTableAccount> = cache.get(&key)?;
 `AltCache::connect` returns only after the initial snapshot and buffered updates
 have been installed. `get` returns an error while the local Yellowstone feed is
 recovering, `None` for a missing table, or Solana's standard
-`AddressLookupTableAccount`. Dropping the last clone of `AltCache` stops its
-background task.
+`AddressLookupTableAccount`. `get_with` reads a table in place without
+cloning it and without checking readiness: while the feed recovers it sees the
+map from before the failure, which lacks only tables created or extended during
+the outage. Use it where slightly stale tables beat none, and `get` where they
+do not. Dropping the last clone of `AltCache` stops its background task.
 
 ## Snapshot gRPC
 
@@ -124,6 +127,17 @@ already in progress remains valid if the live cache later enters recovery.
 The wire schema is in `proto/alt_snapshot.proto`. It is separate from the
 Yellowstone schema because it describes this cache's downstream snapshot API,
 not the upstream Geyser subscription.
+
+Manual test:
+
+```bash
+time grpcurl -plaintext -import-path ~ -proto alt_snapshot.proto  -d '{}' rpc:6009 astralane.alt_cache.v1.AltSnapshot/StreamSnapshot > alt_snapshot
+
+# Stats from fra1, 4.7gb snapshot
+real	0m45.471s
+user	0m32.328s
+sys	0m11.986s
+```
 
 ## JSON-RPC
 
