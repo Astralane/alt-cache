@@ -91,7 +91,7 @@ enum ServeOutcome {
     Shutdown,
 }
 
-fn apply_state_event(event: StateEvent, updater: &mut StateUpdater) -> Result<()> {
+fn apply_state_event(event: StateEvent, updater: &mut StateUpdater) {
     match event {
         StateEvent::Account {
             key,
@@ -99,12 +99,10 @@ fn apply_state_event(event: StateEvent, updater: &mut StateUpdater) -> Result<()
             write_version,
             account,
         } => {
-            updater.queue(key, slot, write_version, account)?;
-            Ok(())
+            updater.queue(key, slot, write_version, account);
         }
         StateEvent::ConfirmedSlot(slot) => {
             updater.confirm(slot);
-            Ok(())
         }
     }
 }
@@ -297,10 +295,7 @@ impl UpdaterService {
         );
 
         while let Some(event) = buffered.pop_front() {
-            if apply_state_event(event, &mut updater).is_err() {
-                self.select_next_yellowstone();
-                return Ok(None);
-            }
+            apply_state_event(event, &mut updater);
         }
         updater.finish_recovery();
         tracing::info!(yellowstone_url, context_slot, "cache ready");
@@ -379,15 +374,7 @@ impl UpdaterService {
                                 return Ok(ServeOutcome::Restart);
                             }
                         };
-                        if let Err(error) = apply_state_event(event.clone(), updater) {
-                            refresh.take();
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "active Yellowstone update failed"
-                            );
-                            self.select_next_yellowstone();
-                            return Ok(ServeOutcome::Restart);
-                        }
+                        apply_state_event(event.clone(), updater);
                         buffer_refresh_event(&mut refresh, event, self.config.stream_capacity);
                     }
                 }
@@ -397,7 +384,7 @@ impl UpdaterService {
                 }) => {
                     if event_source == self.active_source {
                         let event = StateEvent::ConfirmedSlot(slot);
-                        apply_state_event(event.clone(), updater)?;
+                        apply_state_event(event.clone(), updater);
                         buffer_refresh_event(&mut refresh, event, self.config.stream_capacity);
                     }
                 }
@@ -432,15 +419,8 @@ impl UpdaterService {
             fetched_alt_state,
         );
         let buffered_events = std::mem::take(&mut completed.buffered_events);
-        if let Err(error) = buffered_events
-            .into_iter()
-            .try_for_each(|event| apply_state_event(event, &mut refreshed))
-        {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "discarding background ALT state refresh"
-            );
-            return;
+        for event in buffered_events {
+            apply_state_event(event, &mut refreshed);
         }
         refreshed.finish_recovery();
         *updater = refreshed;

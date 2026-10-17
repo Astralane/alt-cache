@@ -320,25 +320,23 @@ mod tests {
         let (store, mut updater) = store();
         for value in [1, 2] {
             let key = [value; 32];
-            updater
-                .queue(
-                    key,
-                    4,
-                    1,
-                    Some(Arc::new(Account {
-                        value: SubscribeUpdateAccountInfo {
-                            pubkey: key.to_vec(),
-                            lamports: 1,
-                            owner: vec![0; 32],
-                            executable: false,
-                            rent_epoch: 0,
-                            data: Vec::new(),
-                            write_version: 1,
-                            txn_signature: None,
-                        },
-                    })),
-                )
-                .unwrap();
+            updater.queue(
+                key,
+                4,
+                1,
+                Some(Arc::new(Account {
+                    value: SubscribeUpdateAccountInfo {
+                        pubkey: key.to_vec(),
+                        lamports: 1,
+                        owner: vec![0; 32],
+                        executable: false,
+                        rent_epoch: 0,
+                        data: Vec::new(),
+                        write_version: 1,
+                        txn_signature: None,
+                    },
+                })),
+            );
         }
         updater.confirm(4);
         let rpc = json_rpc(store, 100_000);
@@ -393,25 +391,23 @@ mod tests {
         let cursor = body["result"]["value"]["paginationKey"].as_str().unwrap();
 
         let key = [3; 32];
-        updater
-            .queue(
-                key,
-                5,
-                1,
-                Some(Arc::new(Account {
-                    value: SubscribeUpdateAccountInfo {
-                        pubkey: key.to_vec(),
-                        lamports: 1,
-                        owner: vec![0; 32],
-                        executable: false,
-                        rent_epoch: 0,
-                        data: Vec::new(),
-                        write_version: 1,
-                        txn_signature: None,
-                    },
-                })),
-            )
-            .unwrap();
+        updater.queue(
+            key,
+            5,
+            1,
+            Some(Arc::new(Account {
+                value: SubscribeUpdateAccountInfo {
+                    pubkey: key.to_vec(),
+                    lamports: 1,
+                    owner: vec![0; 32],
+                    executable: false,
+                    rent_epoch: 0,
+                    data: Vec::new(),
+                    write_version: 1,
+                    txn_signature: None,
+                },
+            })),
+        );
         updater.confirm(5);
 
         let request = format!(

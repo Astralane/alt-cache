@@ -1,5 +1,4 @@
 use crate::store::{Account, Key, Store};
-use anyhow::{Result, ensure};
 use imbl::OrdMap;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -82,25 +81,21 @@ impl StateUpdater {
         slot: u64,
         version: u64,
         account: Option<Arc<Account>>,
-    ) -> Result<bool> {
-        ensure!(
-            self.recovering || slot > self.confirmed_slot,
-            "account update arrived after its slot was confirmed"
-        );
+    ) -> bool {
         if slot < self.bootstrap_slot
             || self
                 .versions
                 .get(&key)
                 .is_some_and(|old| *old >= (slot, version))
         {
-            return Ok(false);
+            return false;
         }
         self.versions.insert(key, (slot, version));
         self.pending
             .entry(slot)
             .or_default()
             .push(Mutation { key, account });
-        Ok(true)
+        true
     }
 
     pub(crate) fn confirm(&mut self, slot: u64) -> bool {
@@ -178,21 +173,21 @@ mod tests {
     fn write_order_accepts_bootstrap_slot_and_rejects_older_versions() {
         let store = Arc::new(Store::new());
         let mut updater = updater(store, "one", 10, BTreeMap::new());
-        assert!(updater.queue([1; 32], 10, 100, None).unwrap());
-        assert!(!updater.queue([1; 32], 10, 99, None).unwrap());
-        assert!(updater.queue([1; 32], 12, 2, None).unwrap());
-        assert!(!updater.queue([1; 32], 12, 1, None).unwrap());
-        assert!(!updater.queue([1; 32], 11, 999, None).unwrap());
+        assert!(updater.queue([1; 32], 10, 100, None));
+        assert!(!updater.queue([1; 32], 10, 99, None));
+        assert!(updater.queue([1; 32], 12, 2, None));
+        assert!(!updater.queue([1; 32], 12, 1, None));
+        assert!(!updater.queue([1; 32], 11, 999, None));
     }
 
     #[test]
     fn source_change_resets_version_domain() {
         let (store, mut updater) = store();
-        updater.queue([1; 32], 13, 999, None).unwrap();
+        updater.queue([1; 32], 13, 999, None);
         updater.invalidate();
         updater = self::updater(store.clone(), "two", 10, BTreeMap::new());
         assert!(!store.health().ready);
-        assert!(updater.queue([1; 32], 13, 1, None).unwrap());
+        assert!(updater.queue([1; 32], 13, 1, None));
     }
 
     #[test]
@@ -201,9 +196,7 @@ mod tests {
         let mut refreshed = updater(store.clone(), "one", 20, BTreeMap::new());
         let key = [8; 32];
 
-        refreshed
-            .queue(key, 21, 1, Some(Arc::new(account(key))))
-            .unwrap();
+        refreshed.queue(key, 21, 1, Some(Arc::new(account(key))));
         refreshed.confirm(21);
 
         assert!(store.health().ready);
@@ -214,6 +207,22 @@ mod tests {
 
         assert!(store.health().ready);
         assert_eq!(store.health().confirmed_slot, 21);
+        assert_eq!(store.health().accounts, 1);
+    }
+
+    #[test]
+    fn late_update_is_published_at_the_next_confirmed_slot() {
+        let (store, mut updater) = store();
+        let key = [8; 32];
+
+        assert!(updater.queue(key, 10, 1, Some(Arc::new(account(key)))));
+        assert!(store.health().ready);
+        assert_eq!(store.health().confirmed_slot, 10);
+        assert_eq!(store.health().accounts, 0);
+
+        assert!(updater.confirm(11));
+        assert!(store.health().ready);
+        assert_eq!(store.health().confirmed_slot, 11);
         assert_eq!(store.health().accounts, 1);
     }
 }
