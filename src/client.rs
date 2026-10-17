@@ -135,6 +135,15 @@ impl AltCache {
         Ok(tables.get(key).map(|account| account.value().clone()))
     }
 
+    pub fn get_with<R>(
+        &self,
+        key: &Address,
+        f: impl FnOnce(&AddressLookupTableAccount) -> R,
+    ) -> Option<R> {
+        let tables = self.inner.tables.load();
+        tables.get(key).map(|account| f(account.value()))
+    }
+
     pub fn is_ready(&self) -> bool {
         self.inner.ready.load(Ordering::Acquire)
     }
@@ -590,6 +599,35 @@ mod tests {
                 .addresses,
             vec![Address::from([9; 32])]
         );
+    }
+
+    #[test]
+    fn get_with_serves_the_last_map_while_recovering() {
+        let key = Address::from([1; 32]);
+        let tables = DashMap::new();
+        tables.insert(
+            key,
+            AddressLookupTableAccount {
+                key,
+                addresses: vec![Address::from([9; 32])],
+            },
+        );
+        let cache = AltCache {
+            inner: Arc::new(Inner {
+                tables: Arc::new(ArcSwap::from_pointee(tables)),
+                ready: Arc::new(AtomicBool::new(false)),
+                confirmed_slot: Arc::new(AtomicU64::new(42)),
+                stop: CancellationToken::new(),
+                task: Mutex::new(None),
+            }),
+        };
+
+        assert!(cache.get(&key).is_err());
+        assert_eq!(
+            cache.get_with(&key, |table| table.addresses.clone()),
+            Some(vec![Address::from([9; 32])])
+        );
+        assert_eq!(cache.get_with(&Address::from([2; 32]), |_| ()), None);
     }
 
     #[test]
