@@ -282,15 +282,21 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::StateUpdater;
+    use crate::state_updater::{FetchedAltState, StateUpdater};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
     fn store() -> (Arc<Store>, StateUpdater) {
         let store = Arc::new(Store::new());
-        let mut updater = StateUpdater::new(store.clone());
-        updater.install("test".into(), 1, BTreeMap::new());
+        let mut updater = StateUpdater::from_fetched_alt_state(
+            store.clone(),
+            "test".into(),
+            FetchedAltState {
+                context_slot: 1,
+                accounts: BTreeMap::new(),
+            },
+        );
         updater.finish_recovery();
         (store, updater)
     }
@@ -319,7 +325,7 @@ mod tests {
                     key,
                     4,
                     1,
-                    Some(Account {
+                    Some(Arc::new(Account {
                         value: SubscribeUpdateAccountInfo {
                             pubkey: key.to_vec(),
                             lamports: 1,
@@ -330,7 +336,7 @@ mod tests {
                             write_version: 1,
                             txn_signature: None,
                         },
-                    }),
+                    })),
                 )
                 .unwrap();
         }
@@ -392,7 +398,7 @@ mod tests {
                 key,
                 5,
                 1,
-                Some(Account {
+                Some(Arc::new(Account {
                     value: SubscribeUpdateAccountInfo {
                         pubkey: key.to_vec(),
                         lamports: 1,
@@ -403,7 +409,7 @@ mod tests {
                         write_version: 1,
                         txn_signature: None,
                     },
-                }),
+                })),
             )
             .unwrap();
         updater.confirm(5);

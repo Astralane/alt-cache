@@ -8,7 +8,7 @@ use solana_account_decoder_client_types::{
 };
 use solana_address_lookup_table_interface::{program, state::AddressLookupTable};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     ops::Bound::{Excluded, Unbounded},
     sync::{
         Arc, Mutex, RwLock,
@@ -140,13 +140,13 @@ struct RetainedSnapshot {
 pub struct Store {
     current: ArcSwap<ServerSnapshot>,
     ready: AtomicBool,
-    source: RwLock<Option<String>>,
+    active_yellowstone_url: RwLock<Option<String>>,
     retained: Mutex<HashMap<u64, RetainedSnapshot>>,
 }
 #[derive(Clone, Serialize)]
 pub struct Health {
     pub ready: bool,
-    pub source: Option<String>,
+    pub active_yellowstone_url: Option<String>,
     pub confirmed_slot: u64,
     pub accounts: usize,
 }
@@ -158,7 +158,7 @@ impl Store {
                 accounts: OrdMap::new(),
             }),
             ready: AtomicBool::new(false),
-            source: RwLock::new(None),
+            active_yellowstone_url: RwLock::new(None),
             retained: Mutex::new(HashMap::new()),
         }
     }
@@ -217,23 +217,28 @@ impl Store {
         let snapshot = self.current.load();
         Health {
             ready: self.ready.load(Ordering::Acquire),
-            source: self.source.read().unwrap().clone(),
+            active_yellowstone_url: self.active_yellowstone_url.read().unwrap().clone(),
             confirmed_slot: snapshot.slot,
             accounts: snapshot.accounts.len(),
         }
     }
 
-    fn invalidate(&self) {
+    pub(crate) fn invalidate(&self) {
         self.ready.store(false, Ordering::Release);
     }
 
-    fn publish(&self, source: &str, slot: u64, accounts: OrdMap<Key, Arc<Account>>) {
+    pub(crate) fn publish(
+        &self,
+        active_yellowstone_url: &str,
+        slot: u64,
+        accounts: OrdMap<Key, Arc<Account>>,
+    ) {
         let current = self.current.load();
         if current.slot != slot || current.slot == 0 {
             self.current
                 .store(Arc::new(ServerSnapshot { slot, accounts }));
         }
-        *self.source.write().unwrap() = Some(source.to_owned());
+        *self.active_yellowstone_url.write().unwrap() = Some(active_yellowstone_url.to_owned());
         self.ready.store(true, Ordering::Release);
     }
 }
@@ -244,120 +249,10 @@ impl Default for Store {
     }
 }
 
-pub(crate) struct StateUpdater {
-    store: Arc<Store>,
-    bootstrap_slot: u64,
-    confirmed_slot: u64,
-    source: String,
-    accounts: OrdMap<Key, Arc<Account>>,
-    pending: BTreeMap<u64, Vec<Mutation>>,
-    versions: HashMap<Key, (u64, u64)>,
-    recovering: bool,
-}
-
-struct Mutation {
-    key: Key,
-    account: Option<Account>,
-}
-
-impl StateUpdater {
-    pub(crate) fn new(store: Arc<Store>) -> Self {
-        Self {
-            store,
-            bootstrap_slot: 0,
-            confirmed_slot: 0,
-            source: String::new(),
-            accounts: OrdMap::new(),
-            pending: BTreeMap::new(),
-            versions: HashMap::new(),
-            recovering: true,
-        }
-    }
-
-    pub(crate) fn invalidate(&mut self) {
-        self.store.invalidate();
-    }
-
-    pub(crate) fn install(
-        &mut self,
-        source: String,
-        slot: u64,
-        accounts: BTreeMap<Key, Arc<Account>>,
-    ) {
-        self.store.invalidate();
-        self.source = source;
-        self.bootstrap_slot = slot;
-        self.confirmed_slot = slot;
-        self.accounts = accounts.into_iter().collect();
-        self.pending.clear();
-        self.versions.clear();
-        self.recovering = true;
-    }
-
-    pub(crate) fn finish_recovery(&mut self) {
-        self.apply_pending_through(self.confirmed_slot);
-        self.store
-            .publish(&self.source, self.confirmed_slot, self.accounts.clone());
-        self.recovering = false;
-    }
-
-    pub(crate) fn queue(
-        &mut self,
-        key: Key,
-        slot: u64,
-        version: u64,
-        account: Option<Account>,
-    ) -> Result<bool> {
-        ensure!(
-            self.recovering || slot > self.confirmed_slot,
-            "account update arrived after its slot was confirmed"
-        );
-        if slot < self.bootstrap_slot
-            || self
-                .versions
-                .get(&key)
-                .is_some_and(|old| *old >= (slot, version))
-        {
-            return Ok(false);
-        }
-        self.versions.insert(key, (slot, version));
-        self.pending
-            .entry(slot)
-            .or_default()
-            .push(Mutation { key, account });
-        Ok(true)
-    }
-
-    pub(crate) fn confirm(&mut self, slot: u64) -> bool {
-        if slot <= self.confirmed_slot {
-            return false;
-        }
-        self.apply_pending_through(slot);
-        self.confirmed_slot = slot;
-        if !self.recovering {
-            self.store
-                .publish(&self.source, slot, self.accounts.clone());
-        }
-        true
-    }
-
-    fn apply_pending_through(&mut self, slot: u64) {
-        let slots: Vec<_> = self.pending.range(..=slot).map(|(slot, _)| *slot).collect();
-        for slot in slots {
-            for mutation in self.pending.remove(&slot).unwrap() {
-                if let Some(account) = mutation.account {
-                    self.accounts.insert(mutation.key, Arc::new(account));
-                } else {
-                    self.accounts.remove(&mutation.key);
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn account(key: Key) -> Account {
         Account {
             value: SubscribeUpdateAccountInfo {
@@ -372,13 +267,7 @@ mod tests {
             },
         }
     }
-    fn store() -> (Arc<Store>, StateUpdater) {
-        let store = Arc::new(Store::new());
-        let mut updater = StateUpdater::new(store.clone());
-        updater.install("one".into(), 10, BTreeMap::new());
-        updater.finish_recovery();
-        (store, updater)
-    }
+
     #[test]
     fn yellowstone_account_preserves_binary_data() {
         use solana_address_lookup_table_interface::state::LookupTableMeta;
@@ -424,33 +313,15 @@ mod tests {
         );
     }
     #[test]
-    fn write_order_accepts_bootstrap_slot_and_rejects_older_versions() {
-        let store = Arc::new(Store::new());
-        let mut updater = StateUpdater::new(store);
-        updater.install("one".into(), 10, BTreeMap::new());
-        assert!(updater.queue([1; 32], 10, 100, None).unwrap());
-        assert!(!updater.queue([1; 32], 10, 99, None).unwrap());
-        assert!(updater.queue([1; 32], 12, 2, None).unwrap());
-        assert!(!updater.queue([1; 32], 12, 1, None).unwrap());
-        assert!(!updater.queue([1; 32], 11, 999, None).unwrap());
-    }
-    #[test]
-    fn source_change_resets_version_domain() {
-        let (s, mut updater) = store();
-        updater.queue([1; 32], 13, 999, None).unwrap();
-        updater.install("two".into(), 10, BTreeMap::new());
-        assert!(!s.health().ready);
-        assert!(updater.queue([1; 32], 13, 1, None).unwrap());
-    }
-    #[test]
     fn snapshot_pages_use_exclusive_ordered_cursors() {
-        let (s, mut updater) = store();
+        let store = Store::new();
+        let mut accounts = OrdMap::new();
         for value in [3, 1, 2] {
             let key = [value; 32];
-            assert!(updater.queue(key, 13, 1, Some(account(key))).unwrap());
+            accounts.insert(key, Arc::new(account(key)));
         }
-        updater.confirm(13);
-        let first = s.snapshot_page(None, None, 2).unwrap();
+        store.publish("one", 13, accounts.clone());
+        let first = store.snapshot_page(None, None, 2).unwrap();
         assert_eq!(
             first
                 .accounts
@@ -462,9 +333,11 @@ mod tests {
         let first_slot = first.slot;
         let first_cursor = first.next;
         let extra = [4; 32];
-        updater.queue(extra, 14, 1, Some(account(extra))).unwrap();
-        updater.confirm(14);
-        let second = s.snapshot_page(Some(first_slot), first_cursor, 2).unwrap();
+        accounts.insert(extra, Arc::new(account(extra)));
+        store.publish("one", 14, accounts);
+        let second = store
+            .snapshot_page(Some(first_slot), first_cursor, 2)
+            .unwrap();
         assert_eq!(second.accounts.len(), 1);
         assert_eq!(second.accounts[0].value.pubkey, vec![3; 32]);
         assert!(second.next.is_none());
