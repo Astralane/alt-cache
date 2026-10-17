@@ -12,7 +12,7 @@ base64 = "0.22"
 bs58 = "0.5"
 dashmap = "6"
 futures = "0.3"
-im = "15"
+imbl = "7"
 jsonrpsee = { version = "0.26", features = ["macros", "server"] }
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

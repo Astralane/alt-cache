@@ -1,193 +1,21 @@
 use crate::{
+    alt_state_fetcher::fetch_full_alt_state,
     config::Config,
     logging,
-    store::{Account, Key, KeyedUiAccount, StateUpdater, Store, parse_key, program_id},
+    state_updater::{FetchedAltState, StateUpdater},
+    store::{Account, Key, Store},
     yellowstone::Event,
 };
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
 use solana_address_lookup_table_interface::program;
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccount;
-
-const PAGE_SIZE: usize = 10_000;
-
-#[derive(Deserialize)]
-struct JsonRpcResponse<T> {
-    result: Option<T>,
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-struct RpcResult<T> {
-    value: T,
-    response_bytes: usize,
-    fetch_duration: Duration,
-    deserialize_duration: Duration,
-}
-
-async fn rpc<T: DeserializeOwned>(
-    client: &reqwest::Client,
-    url: &str,
-    method: &str,
-    params: impl Serialize,
-) -> Result<RpcResult<T>> {
-    let fetch_started = Instant::now();
-    let response = client
-        .post(url)
-        .json(&json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}))
-        .send()
-        .await
-        .map_err(redact_rpc_error)?
-        .error_for_status()
-        .map_err(redact_rpc_error)?;
-    let body = response.bytes().await.map_err(redact_rpc_error)?;
-    let fetch_duration = fetch_started.elapsed();
-    let deserialize_started = Instant::now();
-    let reply: JsonRpcResponse<T> = serde_json::from_slice(&body)?;
-    let deserialize_duration = deserialize_started.elapsed();
-    if let Some(error) = reply.error {
-        anyhow::bail!("RPC error {}: {}", error.code, error.message);
-    }
-    Ok(RpcResult {
-        value: reply.result.context("RPC result missing")?,
-        response_bytes: body.len(),
-        fetch_duration,
-        deserialize_duration,
-    })
-}
-
-fn redact_rpc_error(error: reqwest::Error) -> anyhow::Error {
-    anyhow::Error::new(error.without_url())
-}
-
-#[derive(Deserialize)]
-struct PagedAccounts {
-    accounts: Vec<KeyedUiAccount>,
-    #[serde(rename = "paginationKey")]
-    pagination_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ContextResponse<T> {
-    context: RpcContext,
-    value: T,
-}
-
-#[derive(Deserialize)]
-struct RpcContext {
-    slot: u64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProgramAccountsConfig<'a> {
-    commitment: &'static str,
-    encoding: &'static str,
-    with_context: bool,
-    limit: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pagination_key: Option<&'a str>,
-}
-
-async fn bootstrap(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(u64, BTreeMap<Key, Arc<Account>>)> {
-    let bootstrap_started = Instant::now();
-    let mut bootstrap_slot = None;
-    let mut cursor: Option<String> = None;
-    let mut seen = HashSet::new();
-    let mut accounts = BTreeMap::new();
-    let mut page_number = 0_u64;
-    let mut fetched_accounts = 0_usize;
-    let mut skipped_accounts = 0_usize;
-    let mut response_bytes = 0_u64;
-    let mut fetch_duration = Duration::ZERO;
-    let mut json_deserialize_duration = Duration::ZERO;
-    let mut account_decode_duration = Duration::ZERO;
-    loop {
-        page_number += 1;
-        let config = ProgramAccountsConfig {
-            commitment: "confirmed",
-            encoding: "base64+zstd",
-            with_context: true,
-            limit: PAGE_SIZE,
-            pagination_key: cursor.as_deref(),
-        };
-        let response: RpcResult<ContextResponse<PagedAccounts>> = rpc(
-            client,
-            url,
-            "getProgramAccountsV2",
-            json!([program_id(), config]),
-        )
-        .await?;
-        fetch_duration += response.fetch_duration;
-        json_deserialize_duration += response.deserialize_duration;
-        response_bytes += response.response_bytes as u64;
-        let response = response.value;
-        let slot = response.context.slot;
-        let first_slot = *bootstrap_slot.get_or_insert(slot);
-        ensure!(
-            slot >= first_slot,
-            "RPC snapshot context regressed from slot {first_slot} to {slot}"
-        );
-        let page = response.value;
-        fetched_accounts += page.accounts.len();
-        let decode_started = Instant::now();
-        for entry in page.accounts {
-            if entry.account.lamports == 0 {
-                skipped_accounts += 1;
-                continue;
-            }
-            let key = parse_key(&entry.pubkey)?;
-            let pubkey = entry.pubkey.clone();
-            let account = match Account::from_rpc(entry.pubkey, entry.account) {
-                Ok(account) => account,
-                Err(error) => {
-                    tracing::warn!(%pubkey, %error, "skipping invalid ALT account");
-                    skipped_accounts += 1;
-                    continue;
-                }
-            };
-            accounts.insert(key, Arc::new(account));
-        }
-        account_decode_duration += decode_started.elapsed();
-        let Some(next) = page.pagination_key else {
-            break;
-        };
-        ensure!(seen.insert(next.clone()), "RPC repeated its pagination key");
-        cursor = Some(next);
-    }
-
-    let bootstrap_slot = bootstrap_slot.context("RPC snapshot context missing")?;
-    tracing::info!(
-        bootstrap_slot,
-        pages = page_number,
-        accounts = accounts.len(),
-        fetched_accounts,
-        skipped_accounts,
-        response_bytes,
-        fetch_ms = fetch_duration.as_millis() as u64,
-        json_deserialize_ms = json_deserialize_duration.as_millis() as u64,
-        account_decode_ms = account_decode_duration.as_millis() as u64,
-        elapsed_ms = bootstrap_started.elapsed().as_millis() as u64,
-        "bootstrap snapshot fetched"
-    );
-    Ok((bootstrap_slot, accounts))
-}
 
 fn next_connected(active: usize, connected: &HashSet<usize>, count: usize) -> Option<usize> {
     (1..=count)
@@ -195,92 +23,261 @@ fn next_connected(active: usize, connected: &HashSet<usize>, count: usize) -> Op
         .find(|source| connected.contains(source))
 }
 
-enum ActiveEvent {
-    Account(Box<SubscribeUpdateAccount>),
+#[derive(Clone)]
+enum StateEvent {
+    Account {
+        key: Key,
+        slot: u64,
+        write_version: u64,
+        account: Option<Arc<Account>>,
+    },
     ConfirmedSlot(u64),
+}
+
+struct RefreshInProgress {
+    fetch_task: JoinHandle<Result<FetchedAltState>>,
+    buffered_events: VecDeque<StateEvent>,
+}
+
+impl RefreshInProgress {
+    fn start(
+        client: reqwest::Client,
+        rpc_url: String,
+        buffer_capacity: usize,
+        minimum_context_slot: u64,
+    ) -> Self {
+        Self {
+            fetch_task: tokio::spawn(async move {
+                fetch_full_alt_state(&client, &rpc_url, Some(minimum_context_slot)).await
+            }),
+            buffered_events: VecDeque::with_capacity(buffer_capacity.min(4_096)),
+        }
+    }
+
+    fn buffer(&mut self, event: StateEvent, capacity: usize) -> Result<()> {
+        ensure!(
+            self.buffered_events.len() < capacity,
+            "background refresh update buffer full"
+        );
+        self.buffered_events.push_back(event);
+        Ok(())
+    }
+}
+
+impl Drop for RefreshInProgress {
+    fn drop(&mut self) {
+        self.fetch_task.abort();
+    }
+}
+
+async fn wait_for_refresh(refresh: &mut Option<RefreshInProgress>) -> Result<FetchedAltState> {
+    match refresh {
+        Some(refresh) => (&mut refresh.fetch_task)
+            .await
+            .context("background refresh task failed")?,
+        None => std::future::pending().await,
+    }
+}
+
+enum UpdaterEvent {
+    Shutdown,
+    RefreshDue,
+    RefreshFinished(Result<FetchedAltState>),
+    Yellowstone(Event),
+}
+
+enum ServeOutcome {
+    Restart,
+    Shutdown,
+}
+
+fn apply_state_event(event: StateEvent, updater: &mut StateUpdater) -> Result<()> {
+    match event {
+        StateEvent::Account {
+            key,
+            slot,
+            write_version,
+            account,
+        } => {
+            updater.queue(key, slot, write_version, account)?;
+            Ok(())
+        }
+        StateEvent::ConfirmedSlot(slot) => {
+            updater.confirm(slot);
+            Ok(())
+        }
+    }
+}
+
+fn buffer_refresh_event(
+    refresh: &mut Option<RefreshInProgress>,
+    event: StateEvent,
+    capacity: usize,
+) {
+    let Some(active_refresh) = refresh.as_mut() else {
+        return;
+    };
+    if let Err(error) = active_refresh.buffer(event, capacity) {
+        tracing::warn!(%error, "background ALT state refresh aborted");
+        refresh.take();
+    }
 }
 
 pub async fn run(
     config: Arc<Config>,
     store: Arc<Store>,
-    mut events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<Event>,
     stop: CancellationToken,
 ) -> Result<()> {
-    let bootstrap_rpc_url = config.bootstrap_rpc.resolve_url()?;
-    let sources: Vec<_> = config
-        .grpc_sources
-        .iter()
-        .map(|source| source.resolve_url())
-        .collect::<Result<_>>()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
-    let mut updater = StateUpdater::new(store);
-    let mut connected = HashSet::new();
-    let mut active = 0;
+    UpdaterService::new(config, store, events, stop)?
+        .run()
+        .await
+}
 
-    'recover: loop {
-        updater.invalidate();
-        if !connected.contains(&active)
-            && let Some(source) = next_connected(active, &connected, sources.len())
-        {
-            active = source;
+struct UpdaterService {
+    config: Arc<Config>,
+    store: Arc<Store>,
+    events: mpsc::Receiver<Event>,
+    stop: CancellationToken,
+    client: reqwest::Client,
+    bootstrap_rpc_url: String,
+    yellowstone_urls: Vec<String>,
+    connected_sources: HashSet<usize>,
+    active_source: usize,
+}
+
+impl UpdaterService {
+    fn new(
+        config: Arc<Config>,
+        store: Arc<Store>,
+        events: mpsc::Receiver<Event>,
+        stop: CancellationToken,
+    ) -> Result<Self> {
+        let bootstrap_rpc_url = config.bootstrap_rpc.resolve_url()?;
+        let yellowstone_urls = config
+            .grpc_sources
+            .iter()
+            .map(|source| source.resolve_url())
+            .collect::<Result<_>>()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?;
+
+        Ok(Self {
+            config,
+            store,
+            events,
+            stop,
+            client,
+            bootstrap_rpc_url,
+            yellowstone_urls,
+            connected_sources: HashSet::new(),
+            active_source: 0,
+        })
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let mut updater = StateUpdater::new(self.store.clone());
+
+        loop {
+            updater.invalidate();
+            if !self.wait_for_active_yellowstone().await? {
+                break;
+            }
+            let Some(ready_updater) = self.bootstrap_alt_state().await? else {
+                if self.stop.is_cancelled() {
+                    break;
+                }
+                continue;
+            };
+            updater = ready_updater;
+
+            match self.serve_alt_state(&mut updater).await? {
+                ServeOutcome::Restart => continue,
+                ServeOutcome::Shutdown => break,
+            }
         }
-        while !connected.contains(&active) {
+
+        updater.invalidate();
+        Ok(())
+    }
+
+    async fn wait_for_active_yellowstone(&mut self) -> Result<bool> {
+        if !self.connected_sources.contains(&self.active_source) {
+            self.select_next_yellowstone();
+        }
+        while !self.connected_sources.contains(&self.active_source) {
             let event = tokio::select! {
-                _ = stop.cancelled() => break 'recover,
-                event = events.recv() => event.context("all Yellowstone sources stopped")?,
+                _ = self.stop.cancelled() => return Ok(false),
+                event = self.events.recv() => {
+                    event.context("all Yellowstone sources stopped")?
+                }
             };
             match event {
                 Event::Connected { source } => {
-                    connected.insert(source);
-                    active = source;
+                    self.connected_sources.insert(source);
+                    self.active_source = source;
                 }
                 Event::Disconnected { source } => {
-                    connected.remove(&source);
+                    self.connected_sources.remove(&source);
                 }
                 Event::Account { .. } | Event::ConfirmedSlot { .. } => {}
             }
         }
+        Ok(true)
+    }
 
-        let source = sources[active].clone();
-        tracing::info!(source, "starting state recovery");
-        let bootstrap_fut = bootstrap(&client, &bootstrap_rpc_url);
-        tokio::pin!(bootstrap_fut);
-        let mut buffered = VecDeque::with_capacity(config.stream_capacity.min(4_096));
-        let bootstrap_result = loop {
+    async fn bootstrap_alt_state(&mut self) -> Result<Option<StateUpdater>> {
+        let yellowstone_url = self.yellowstone_urls[self.active_source].clone();
+        tracing::info!(yellowstone_url, "starting ALT state bootstrap");
+        let client = self.client.clone();
+        let bootstrap_rpc_url = self.bootstrap_rpc_url.clone();
+        let fetch_fut = fetch_full_alt_state(&client, &bootstrap_rpc_url, None);
+        tokio::pin!(fetch_fut);
+        let mut buffered = VecDeque::with_capacity(self.config.stream_capacity.min(10_000));
+        let fetch_result = loop {
             tokio::select! {
-                _ = stop.cancelled() => break 'recover,
-                result = &mut bootstrap_fut => break result,
-                event = events.recv() => {
+                _ = self.stop.cancelled() => return Ok(None),
+                result = &mut fetch_fut => break result,
+                event = self.events.recv() => {
                     match event.context("all Yellowstone sources stopped")? {
-                        Event::Connected { source } => { connected.insert(source); }
+                        Event::Connected { source } => {
+                            self.connected_sources.insert(source);
+                        }
                         Event::Disconnected { source: failed } => {
-                            connected.remove(&failed);
-                            if failed == active {
-                                if let Some(source) = next_connected(active, &connected, sources.len()) {
-                                    active = source;
-                                }
-                                continue 'recover;
+                            self.connected_sources.remove(&failed);
+                            if failed == self.active_source {
+                                self.select_next_yellowstone();
+                                return Ok(None);
                             }
                         }
                         Event::Account { source, update } => {
-                            if source == active {
-                                ensure!(buffered.len() < config.stream_capacity, "recovery update buffer full");
-                                buffered.push_back(ActiveEvent::Account(update));
+                            if source == self.active_source {
+                                ensure!(buffered.len() < self.config.stream_capacity, "bootstrap update buffer full");
+                                match decode_account_update(*update) {
+                                    Ok(event) => buffered.push_back(event),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            error = %format!("{error:#}"),
+                                            "active Yellowstone update failed"
+                                        );
+                                        self.select_next_yellowstone();
+                                        return Ok(None);
+                                    }
+                                }
                             }
                         }
                         Event::ConfirmedSlot { source, slot } => {
-                            if source == active {
-                                ensure!(buffered.len() < config.stream_capacity, "recovery update buffer full");
-                                buffered.push_back(ActiveEvent::ConfirmedSlot(slot));
+                            if source == self.active_source {
+                                ensure!(buffered.len() < self.config.stream_capacity, "bootstrap update buffer full");
+                                buffered.push_back(StateEvent::ConfirmedSlot(slot));
                             }
                         }
                     }
                 }
             }
         };
-        let (bootstrap_slot, accounts) = match bootstrap_result {
+        let fetched_alt_state = match fetch_result {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(
@@ -288,87 +285,184 @@ pub async fn run(
                     "ALT cache bootstrap RPC failed; retrying"
                 );
                 logging::alert("ALT cache bootstrap RPC failed; readiness is false");
-                tokio::select! {
-                    _ = stop.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
-                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Ok(None);
             }
         };
-        updater.install(source.clone(), bootstrap_slot, accounts);
+        let context_slot = fetched_alt_state.context_slot;
+        let mut updater = StateUpdater::from_fetched_alt_state(
+            self.store.clone(),
+            yellowstone_url.clone(),
+            fetched_alt_state,
+        );
 
-        let full_refresh_timer =
-            tokio::time::sleep(Duration::from_secs(config.full_refresh_interval_secs));
-        tokio::pin!(full_refresh_timer);
         while let Some(event) = buffered.pop_front() {
-            let result = match event {
-                ActiveEvent::Account(update) => apply(*update, &mut updater),
-                ActiveEvent::ConfirmedSlot(slot) => {
-                    updater.confirm(slot);
-                    Ok(())
-                }
-            };
-            if result.is_err() {
-                if let Some(source) = next_connected(active, &connected, sources.len()) {
-                    active = source;
-                }
-                continue 'recover;
+            if apply_state_event(event, &mut updater).is_err() {
+                self.select_next_yellowstone();
+                return Ok(None);
             }
         }
         updater.finish_recovery();
-        tracing::info!(source, bootstrap_slot, "cache ready");
+        tracing::info!(yellowstone_url, context_slot, "cache ready");
+        Ok(Some(updater))
+    }
+
+    async fn serve_alt_state(&mut self, updater: &mut StateUpdater) -> Result<ServeOutcome> {
+        let yellowstone_url = self.yellowstone_urls[self.active_source].clone();
+        let mut refresh_timer =
+            tokio::time::interval(Duration::from_secs(self.config.full_refresh_interval_secs));
+        refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        refresh_timer.tick().await;
+        let mut refresh = None;
 
         loop {
-            let event = tokio::select! {
-                _ = stop.cancelled() => break 'recover,
-                _ = &mut full_refresh_timer => {
-                    tracing::info!(source, "starting scheduled full refresh");
-                    continue 'recover;
+            let action = tokio::select! {
+                _ = self.stop.cancelled() => UpdaterEvent::Shutdown,
+                _ = refresh_timer.tick() => UpdaterEvent::RefreshDue,
+                result = wait_for_refresh(&mut refresh) => {
+                    UpdaterEvent::RefreshFinished(result)
                 }
-                event = events.recv() => event.context("all Yellowstone sources stopped")?,
+                event = self.events.recv() => UpdaterEvent::Yellowstone(
+                    event.context("all Yellowstone sources stopped")?
+                ),
             };
-            match event {
-                Event::Connected { source } => {
-                    connected.insert(source);
-                }
-                Event::Disconnected { source: failed } => {
-                    connected.remove(&failed);
-                    if failed == active {
-                        if let Some(source) = next_connected(active, &connected, sources.len()) {
-                            active = source;
-                        }
-                        logging::alert(format!(
-                            "ALT cache source {source} failed; readiness is false"
+
+            match action {
+                UpdaterEvent::Shutdown => return Ok(ServeOutcome::Shutdown),
+                UpdaterEvent::RefreshDue => {
+                    if refresh.is_none() {
+                        tracing::info!(yellowstone_url, "starting background ALT state refresh");
+                        refresh = Some(RefreshInProgress::start(
+                            self.client.clone(),
+                            self.bootstrap_rpc_url.clone(),
+                            self.config.stream_capacity,
+                            updater.confirmed_slot(),
                         ));
-                        continue 'recover;
                     }
                 }
-                Event::Account {
+                UpdaterEvent::RefreshFinished(result) => {
+                    self.install_refreshed_alt_state(
+                        result,
+                        &mut refresh,
+                        updater,
+                        &yellowstone_url,
+                    );
+                }
+                UpdaterEvent::Yellowstone(Event::Connected { source }) => {
+                    self.connected_sources.insert(source);
+                }
+                UpdaterEvent::Yellowstone(Event::Disconnected { source: failed }) => {
+                    self.connected_sources.remove(&failed);
+                    if failed == self.active_source {
+                        refresh.take();
+                        self.select_next_yellowstone();
+                        logging::alert(format!(
+                            "ALT cache source {yellowstone_url} failed; readiness is false"
+                        ));
+                        return Ok(ServeOutcome::Restart);
+                    }
+                }
+                UpdaterEvent::Yellowstone(Event::Account {
                     source: event_source,
                     update,
-                } => {
-                    if event_source == active && apply(*update, &mut updater).is_err() {
-                        if let Some(source) = next_connected(active, &connected, sources.len()) {
-                            active = source;
+                }) => {
+                    if event_source == self.active_source {
+                        let event = match decode_account_update(*update) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                refresh.take();
+                                tracing::warn!(
+                                    error = %format!("{error:#}"),
+                                    "active Yellowstone update failed"
+                                );
+                                self.select_next_yellowstone();
+                                return Ok(ServeOutcome::Restart);
+                            }
+                        };
+                        if let Err(error) = apply_state_event(event.clone(), updater) {
+                            refresh.take();
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "active Yellowstone update failed"
+                            );
+                            self.select_next_yellowstone();
+                            return Ok(ServeOutcome::Restart);
                         }
-                        continue 'recover;
+                        buffer_refresh_event(&mut refresh, event, self.config.stream_capacity);
                     }
                 }
-                Event::ConfirmedSlot {
+                UpdaterEvent::Yellowstone(Event::ConfirmedSlot {
                     source: event_source,
                     slot,
-                } => {
-                    if event_source == active {
-                        updater.confirm(slot);
+                }) => {
+                    if event_source == self.active_source {
+                        let event = StateEvent::ConfirmedSlot(slot);
+                        apply_state_event(event.clone(), updater)?;
+                        buffer_refresh_event(&mut refresh, event, self.config.stream_capacity);
                     }
                 }
             }
         }
     }
-    updater.invalidate();
-    Ok(())
+
+    fn install_refreshed_alt_state(
+        &self,
+        result: Result<FetchedAltState>,
+        refresh: &mut Option<RefreshInProgress>,
+        updater: &mut StateUpdater,
+        yellowstone_url: &str,
+    ) {
+        let Some(mut completed) = refresh.take() else {
+            return;
+        };
+        let fetched_alt_state = match result {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "background ALT state refresh failed"
+                );
+                return;
+            }
+        };
+        let context_slot = fetched_alt_state.context_slot;
+        let mut refreshed = StateUpdater::from_fetched_alt_state(
+            self.store.clone(),
+            yellowstone_url.to_owned(),
+            fetched_alt_state,
+        );
+        let buffered_events = std::mem::take(&mut completed.buffered_events);
+        if let Err(error) = buffered_events
+            .into_iter()
+            .try_for_each(|event| apply_state_event(event, &mut refreshed))
+        {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "discarding background ALT state refresh"
+            );
+            return;
+        }
+        refreshed.finish_recovery();
+        *updater = refreshed;
+        tracing::info!(
+            yellowstone_url,
+            context_slot,
+            "background ALT state refresh installed"
+        );
+    }
+
+    fn select_next_yellowstone(&mut self) {
+        if let Some(source) = next_connected(
+            self.active_source,
+            &self.connected_sources,
+            self.yellowstone_urls.len(),
+        ) {
+            self.active_source = source;
+        }
+    }
 }
 
-fn apply(update: SubscribeUpdateAccount, updater: &mut StateUpdater) -> Result<()> {
+fn decode_account_update(update: SubscribeUpdateAccount) -> Result<StateEvent> {
     let account = update.account.context("account body missing")?;
     let key: Key = account
         .pubkey
@@ -385,7 +479,7 @@ fn apply(update: SubscribeUpdateAccount, updater: &mut StateUpdater) -> Result<(
         None
     } else {
         match Account::from_yellowstone(account) {
-            Ok(account) => Some(account),
+            Ok(account) => Some(Arc::new(account)),
             Err(error) => {
                 let pubkey = bs58::encode(key).into_string();
                 tracing::warn!(%pubkey, %error, "removing invalid ALT account");
@@ -393,8 +487,12 @@ fn apply(update: SubscribeUpdateAccount, updater: &mut StateUpdater) -> Result<(
             }
         }
     };
-    updater.queue(key, update.slot, write_version, value)?;
-    Ok(())
+    Ok(StateEvent::Account {
+        key,
+        slot: update.slot,
+        write_version,
+        account: value,
+    })
 }
 
 #[cfg(test)]

@@ -29,7 +29,12 @@ until recovery installs a new snapshot.
 
 ALT closure drains the account and clears its data without changing its owner,
 so the owner subscription also reports closures. A full refresh runs once per
-`full_refresh_interval_secs`. It makes the cache unavailable while it rebuilds.
+`full_refresh_interval_secs`. The existing state remains ready and continues to
+receive Yellowstone updates while the replacement is fetched. Those updates
+are replayed into the replacement before one atomic publication. A failed
+scheduled refresh leaves the existing state unchanged. Refresh requests use the
+currently served confirmed slot as `minContextSlot`, preventing a lagging RPC
+response from replacing newer state.
 
 ## Source requirements
 

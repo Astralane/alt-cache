@@ -85,7 +85,10 @@ pub async fn serve(addr: SocketAddr, store: Arc<Store>, stop: CancellationToken)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Account, StateUpdater};
+    use crate::{
+        state_updater::{FetchedAltState, StateUpdater},
+        store::Account,
+    };
     use futures::StreamExt;
     use std::collections::BTreeMap;
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
@@ -93,7 +96,6 @@ mod tests {
     #[tokio::test]
     async fn stream_keeps_its_captured_snapshot_after_invalidation() {
         let store = Arc::new(Store::new());
-        let mut updater = StateUpdater::new(store.clone());
         let key = [7; 32];
         let account = Account {
             value: SubscribeUpdateAccountInfo {
@@ -102,10 +104,13 @@ mod tests {
                 ..Default::default()
             },
         };
-        updater.install(
+        let mut updater = StateUpdater::from_fetched_alt_state(
+            store.clone(),
             "test".into(),
-            42,
-            BTreeMap::from([(key, Arc::new(account))]),
+            FetchedAltState {
+                context_slot: 42,
+                accounts: BTreeMap::from([(key, Arc::new(account))]),
+            },
         );
         updater.finish_recovery();
         let service = SnapshotService {
