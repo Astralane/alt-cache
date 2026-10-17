@@ -79,7 +79,7 @@ async fn wait_for_refresh(refresh: &mut Option<RefreshInProgress>) -> Result<Fet
     }
 }
 
-enum ServingAction {
+enum UpdaterEvent {
     Shutdown,
     RefreshDue,
     RefreshFinished(Result<FetchedAltState>),
@@ -317,19 +317,19 @@ impl UpdaterService {
 
         loop {
             let action = tokio::select! {
-                _ = self.stop.cancelled() => ServingAction::Shutdown,
-                _ = refresh_timer.tick() => ServingAction::RefreshDue,
+                _ = self.stop.cancelled() => UpdaterEvent::Shutdown,
+                _ = refresh_timer.tick() => UpdaterEvent::RefreshDue,
                 result = wait_for_refresh(&mut refresh) => {
-                    ServingAction::RefreshFinished(result)
+                    UpdaterEvent::RefreshFinished(result)
                 }
-                event = self.events.recv() => ServingAction::Yellowstone(
+                event = self.events.recv() => UpdaterEvent::Yellowstone(
                     event.context("all Yellowstone sources stopped")?
                 ),
             };
 
             match action {
-                ServingAction::Shutdown => return Ok(ServeOutcome::Shutdown),
-                ServingAction::RefreshDue => {
+                UpdaterEvent::Shutdown => return Ok(ServeOutcome::Shutdown),
+                UpdaterEvent::RefreshDue => {
                     if refresh.is_none() {
                         tracing::info!(yellowstone_url, "starting background ALT state refresh");
                         refresh = Some(RefreshInProgress::start(
@@ -340,7 +340,7 @@ impl UpdaterService {
                         ));
                     }
                 }
-                ServingAction::RefreshFinished(result) => {
+                UpdaterEvent::RefreshFinished(result) => {
                     self.install_refreshed_alt_state(
                         result,
                         &mut refresh,
@@ -348,10 +348,10 @@ impl UpdaterService {
                         &yellowstone_url,
                     );
                 }
-                ServingAction::Yellowstone(Event::Connected { source }) => {
+                UpdaterEvent::Yellowstone(Event::Connected { source }) => {
                     self.connected_sources.insert(source);
                 }
-                ServingAction::Yellowstone(Event::Disconnected { source: failed }) => {
+                UpdaterEvent::Yellowstone(Event::Disconnected { source: failed }) => {
                     self.connected_sources.remove(&failed);
                     if failed == self.active_source {
                         refresh.take();
@@ -362,7 +362,7 @@ impl UpdaterService {
                         return Ok(ServeOutcome::Restart);
                     }
                 }
-                ServingAction::Yellowstone(Event::Account {
+                UpdaterEvent::Yellowstone(Event::Account {
                     source: event_source,
                     update,
                 }) => {
@@ -391,7 +391,7 @@ impl UpdaterService {
                         buffer_refresh_event(&mut refresh, event, self.config.stream_capacity);
                     }
                 }
-                ServingAction::Yellowstone(Event::ConfirmedSlot {
+                UpdaterEvent::Yellowstone(Event::ConfirmedSlot {
                     source: event_source,
                     slot,
                 }) => {
