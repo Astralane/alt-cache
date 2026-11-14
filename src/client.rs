@@ -4,14 +4,14 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use futures::StreamExt;
 use serde::Deserialize;
 use solana_address::Address;
 use solana_address_lookup_table_interface::{program, state::AddressLookupTable};
 use solana_message::AddressLookupTableAccount;
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::HashSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -29,7 +29,6 @@ use yellowstone_grpc_proto::prelude::{
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const SNAPSHOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const YELLOWSTONE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-const UPDATE_BUFFER_CAPACITY: usize = 16_384;
 
 /// Bootstrap and live-source endpoints used to initialize an ALT cache.
 #[derive(Deserialize)]
@@ -146,10 +145,8 @@ impl AltCache {
 
 struct Session {
     source_index: usize,
-    bootstrap_slot: u64,
     confirmed_slot: u64,
     tables: Arc<DashMap<Address, AddressLookupTableAccount>>,
-    pending: BTreeMap<u64, Vec<SubscribeUpdateAccount>>,
     requests: mpsc::Sender<SubscribeRequest>,
     stream: Streaming<SubscribeUpdate>,
 }
@@ -228,62 +225,39 @@ async fn establish_session_from_source(config: &AltConfig, source_index: usize) 
         .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
         .await?
         .into_inner();
-    let snapshot = fetch_snapshot_from_any(&config.snapshot_grpc);
-    tokio::pin!(snapshot);
-    let mut buffered = VecDeque::with_capacity(UPDATE_BUFFER_CAPACITY);
-    let (slot, tables) = loop {
-        tokio::select! {
-            snapshot = &mut snapshot => break snapshot?,
-            update = stream.next() => {
-                let update = update.context("Yellowstone stream closed during bootstrap")??;
-                match update.update_oneof {
-                    Some(UpdateOneof::Ping(_)) => yellowstone::send_ping(&requests)?,
-                    Some(UpdateOneof::Account(update)) => {
-                        ensure!(
-                            buffered.len() < UPDATE_BUFFER_CAPACITY,
-                            "ALT client bootstrap update buffer full"
-                        );
-                        buffered.push_back(BufferedEvent::Account(update));
+    let tables = Arc::new(DashMap::new());
+    // Live updates apply as they arrive. Tables only grow until closed, so the older snapshot
+    // filling the same map can't undo them, and nothing needs to be held back.
+    let mut confirmed_slot = 0;
+    let snapshot_slot = {
+        let snapshot = fetch_snapshot_from_any(&config.snapshot_grpc, &tables);
+        tokio::pin!(snapshot);
+        loop {
+            tokio::select! {
+                snapshot = &mut snapshot => break snapshot?,
+                update = stream.next() => {
+                    let update = update.context("Yellowstone stream closed during bootstrap")??;
+                    match update.update_oneof {
+                        Some(UpdateOneof::Ping(_)) => yellowstone::send_ping(&requests)?,
+                        Some(UpdateOneof::Account(update)) => apply_update(&tables, update)?,
+                        Some(UpdateOneof::Slot(update))
+                            if update.status == SlotStatus::SlotConfirmed as i32 =>
+                        {
+                            confirmed_slot = confirmed_slot.max(update.slot);
+                        }
+                        _ => {}
                     }
-                    Some(UpdateOneof::Slot(update))
-                        if update.status == SlotStatus::SlotConfirmed as i32 =>
-                    {
-                        ensure!(
-                            buffered.len() < UPDATE_BUFFER_CAPACITY,
-                            "ALT client bootstrap update buffer full"
-                        );
-                        buffered.push_back(BufferedEvent::ConfirmedSlot(update.slot));
-                    }
-                    _ => {}
                 }
             }
         }
     };
-    let mut session = Session {
+    Ok(Session {
         source_index,
-        bootstrap_slot: slot,
-        confirmed_slot: slot,
+        confirmed_slot: snapshot_slot.max(confirmed_slot),
         tables,
-        pending: BTreeMap::new(),
         requests,
         stream,
-    };
-    for event in buffered {
-        match event {
-            BufferedEvent::Account(update) => queue_update(&mut session, update, true)?,
-            BufferedEvent::ConfirmedSlot(slot) => {
-                confirm(&mut session, slot)?;
-            }
-        }
-    }
-    let confirmed_slot = session.confirmed_slot;
-    apply_pending_through(&mut session, confirmed_slot)?;
-    Ok(session)
-}
-
-enum BufferedEvent {
-    Account(SubscribeUpdateAccount),
-    ConfirmedSlot(u64),
+    })
 }
 
 async fn follow(
@@ -301,13 +275,12 @@ async fn follow(
         };
         match update.update_oneof {
             Some(UpdateOneof::Ping(_)) => yellowstone::send_ping(&session.requests)?,
-            Some(UpdateOneof::Account(update)) => {
-                queue_update(session, update, false)?;
-            }
+            Some(UpdateOneof::Account(update)) => apply_update(&session.tables, update)?,
             Some(UpdateOneof::Slot(update))
                 if update.status == SlotStatus::SlotConfirmed as i32
-                    && confirm(session, update.slot)? =>
+                    && update.slot > session.confirmed_slot =>
             {
+                session.confirmed_slot = update.slot;
                 confirmed_slot.store(update.slot, Ordering::Release);
             }
             _ => {}
@@ -317,7 +290,8 @@ async fn follow(
 
 async fn fetch_snapshot(
     url: &str,
-) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
+    tables: &DashMap<Address, AddressLookupTableAccount>,
+) -> Result<u64> {
     let started = Instant::now();
     let channel = Endpoint::from_shared(url.to_owned())?
         .connect_timeout(SNAPSHOT_CONNECT_TIMEOUT)
@@ -329,7 +303,7 @@ async fn fetch_snapshot(
         .stream_snapshot(SnapshotRequest {})
         .await?
         .into_inner();
-    let mut download = SnapshotDownload::default();
+    let mut download = SnapshotDownload::new(tables);
     while let Some(chunk) = stream.message().await? {
         download.push(chunk)?;
     }
@@ -337,31 +311,42 @@ async fn fetch_snapshot(
     tracing::info!(
         snapshot_slot = snapshot.slot,
         chunks = snapshot.chunks,
-        accounts = snapshot.tables.len(),
+        accounts = snapshot.accounts,
         payload_bytes = snapshot.payload_bytes,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "ALT client snapshot fetched"
     );
-    Ok((snapshot.slot, snapshot.tables))
+    Ok(snapshot.slot)
 }
 
-#[derive(Default)]
-struct SnapshotDownload {
+struct SnapshotDownload<'a> {
+    tables: &'a DashMap<Address, AddressLookupTableAccount>,
     slot: Option<u64>,
     total_accounts: Option<u64>,
-    tables: Option<Arc<DashMap<Address, AddressLookupTableAccount>>>,
+    received: u64,
     chunks: u64,
     payload_bytes: u64,
 }
 
 struct CompletedSnapshot {
     slot: u64,
-    tables: Arc<DashMap<Address, AddressLookupTableAccount>>,
+    accounts: u64,
     chunks: u64,
     payload_bytes: u64,
 }
 
-impl SnapshotDownload {
+impl<'a> SnapshotDownload<'a> {
+    fn new(tables: &'a DashMap<Address, AddressLookupTableAccount>) -> Self {
+        Self {
+            tables,
+            slot: None,
+            total_accounts: None,
+            received: 0,
+            chunks: 0,
+            payload_bytes: 0,
+        }
+    }
+
     fn push(&mut self, chunk: crate::proto::SnapshotChunk) -> Result<()> {
         self.chunks += 1;
         let first_slot = *self.slot.get_or_insert(chunk.confirmed_slot);
@@ -376,22 +361,13 @@ impl SnapshotDownload {
             "snapshot account count changed from {expected_accounts} to {}",
             chunk.total_accounts
         );
-        let capacity = usize::try_from(expected_accounts).context("snapshot is too large")?;
-        let tables = self
-            .tables
-            .get_or_insert_with(|| Arc::new(DashMap::with_capacity(capacity)));
         for account in chunk.accounts {
+            self.received += 1;
             self.payload_bytes += (account.pubkey.len() + account.data.len()) as u64;
             let key = Address::try_from(account.pubkey.as_slice())?;
             let table = AddressLookupTable::deserialize(&account.data)
                 .map_err(|_| anyhow::anyhow!("invalid ALT account"))?;
-            tables.insert(
-                key,
-                AddressLookupTableAccount {
-                    key,
-                    addresses: table.addresses.into_owned(),
-                },
-            );
+            insert_unless_older(self.tables, key, table.addresses.into_owned());
         }
         Ok(())
     }
@@ -399,15 +375,15 @@ impl SnapshotDownload {
     fn finish(self) -> Result<CompletedSnapshot> {
         let slot = self.slot.context("snapshot gRPC stream was empty")?;
         let total_accounts = self.total_accounts.unwrap();
-        let tables = self.tables.unwrap();
+        // Counted, not taken from the map: live updates may have added tables to it meanwhile.
         ensure!(
-            tables.len() as u64 == total_accounts,
+            self.received == total_accounts,
             "snapshot ended after {} of {total_accounts} accounts",
-            tables.len()
+            self.received
         );
         Ok(CompletedSnapshot {
             slot,
-            tables,
+            accounts: self.received,
             chunks: self.chunks,
             payload_bytes: self.payload_bytes,
         })
@@ -416,10 +392,11 @@ impl SnapshotDownload {
 
 async fn fetch_snapshot_from_any(
     urls: &[String],
-) -> Result<(u64, Arc<DashMap<Address, AddressLookupTableAccount>>)> {
+    tables: &DashMap<Address, AddressLookupTableAccount>,
+) -> Result<u64> {
     let mut last_error = None;
     for (index, url) in urls.iter().enumerate() {
-        match fetch_snapshot(url).await {
+        match fetch_snapshot(url, tables).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => {
                 tracing::warn!(
@@ -446,53 +423,23 @@ fn apply_update(
     }
     let table = AddressLookupTable::deserialize(&account.data)
         .map_err(|_| anyhow::anyhow!("invalid ALT account"))?;
-    tables.insert(
-        key,
-        AddressLookupTableAccount {
-            key,
-            addresses: table.addresses.into_owned(),
-        },
-    );
+    insert_unless_older(tables, key, table.addresses.into_owned());
     Ok(())
 }
 
-fn queue_update(
-    session: &mut Session,
-    update: SubscribeUpdateAccount,
-    recovering: bool,
-) -> Result<()> {
-    if update.slot < session.bootstrap_slot {
-        return Ok(());
-    }
-    ensure!(
-        recovering || update.slot > session.confirmed_slot,
-        "account update arrived after its slot was confirmed"
-    );
-    session.pending.entry(update.slot).or_default().push(update);
-    Ok(())
-}
-
-fn confirm(session: &mut Session, slot: u64) -> Result<bool> {
-    if slot <= session.confirmed_slot {
-        return Ok(false);
-    }
-    apply_pending_through(session, slot)?;
-    session.confirmed_slot = slot;
-    Ok(true)
-}
-
-fn apply_pending_through(session: &mut Session, slot: u64) -> Result<()> {
-    let slots: Vec<_> = session
-        .pending
-        .range(..=slot)
-        .map(|(slot, _)| *slot)
-        .collect();
-    for slot in slots {
-        for update in session.pending.remove(&slot).unwrap() {
-            apply_update(&session.tables, update)?;
+/// Lookup tables only grow until closed, so a shorter copy is older: late, replayed or snapshot
+/// writes never replace a newer cached table.
+fn insert_unless_older(
+    tables: &DashMap<Address, AddressLookupTableAccount>,
+    key: Address,
+    addresses: Vec<Address>,
+) {
+    match tables.entry(key) {
+        Entry::Occupied(cached) if cached.get().addresses.len() >= addresses.len() => {}
+        entry => {
+            entry.insert(AddressLookupTableAccount { key, addresses });
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -502,11 +449,20 @@ mod tests {
     use solana_address_lookup_table_interface::state::LookupTableMeta;
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
-    fn account_update(key: Address, lamports: u64) -> SubscribeUpdateAccount {
-        let table = AddressLookupTable {
+    fn table_data(addresses: &[Address]) -> Vec<u8> {
+        AddressLookupTable {
             meta: LookupTableMeta::default(),
-            addresses: std::borrow::Cow::Owned(vec![Address::from([9; 32])]),
-        };
+            addresses: std::borrow::Cow::Owned(addresses.to_vec()),
+        }
+        .serialize_for_tests()
+        .unwrap()
+    }
+
+    fn account_update(
+        key: Address,
+        lamports: u64,
+        addresses: &[Address],
+    ) -> SubscribeUpdateAccount {
         SubscribeUpdateAccount {
             account: Some(SubscribeUpdateAccountInfo {
                 pubkey: key.to_bytes().to_vec(),
@@ -514,7 +470,7 @@ mod tests {
                 owner: program::id().to_bytes().to_vec(),
                 executable: false,
                 rent_epoch: 0,
-                data: table.serialize_for_tests().unwrap(),
+                data: table_data(addresses),
                 write_version: 1,
                 txn_signature: None,
             }),
@@ -564,44 +520,73 @@ mod tests {
 
     #[test]
     fn snapshot_download_decodes_and_validates_the_stream() {
-        let table = AddressLookupTable {
-            meta: LookupTableMeta::default(),
-            addresses: std::borrow::Cow::Owned(vec![Address::from([9; 32])]),
-        };
-        let mut download = SnapshotDownload::default();
+        let tables = DashMap::new();
+        let mut download = SnapshotDownload::new(&tables);
         download
             .push(SnapshotChunk {
                 confirmed_slot: 42,
                 total_accounts: 1,
                 accounts: vec![AltAccount {
                     pubkey: vec![1; 32],
-                    data: table.serialize_for_tests().unwrap(),
+                    data: table_data(&[Address::from([9; 32])]),
                 }],
             })
             .unwrap();
         let snapshot = download.finish().unwrap();
         assert_eq!(snapshot.slot, 42);
-        assert_eq!(snapshot.chunks, 1);
+        assert_eq!((snapshot.chunks, snapshot.accounts), (1, 1));
         assert_eq!(
-            snapshot
-                .tables
-                .get(&Address::from([1; 32]))
-                .unwrap()
-                .addresses,
+            tables.get(&Address::from([1; 32])).unwrap().addresses,
             vec![Address::from([9; 32])]
         );
+    }
+
+    #[test]
+    fn a_snapshot_never_shrinks_a_table_written_live_meanwhile() {
+        let (key, created) = (Address::from([1; 32]), Address::from([2; 32]));
+        let (a, b) = (Address::from([8; 32]), Address::from([9; 32]));
+        let tables = DashMap::new();
+        // Live updates land in the same map while the snapshot downloads.
+        apply_update(&tables, account_update(key, 1, &[a, b])).unwrap();
+        apply_update(&tables, account_update(created, 1, &[a])).unwrap();
+        let mut download = SnapshotDownload::new(&tables);
+        download
+            .push(SnapshotChunk {
+                confirmed_slot: 42,
+                total_accounts: 1,
+                accounts: vec![AltAccount {
+                    pubkey: key.to_bytes().to_vec(),
+                    data: table_data(&[a]),
+                }],
+            })
+            .unwrap();
+
+        // Complete even though the map holds more tables than the snapshot sent.
+        assert_eq!(download.finish().unwrap().accounts, 1);
+        assert_eq!(tables.get(&key).unwrap().addresses, vec![a, b]);
+        assert_eq!(tables.get(&created).unwrap().addresses, vec![a]);
+    }
+
+    #[test]
+    fn late_or_replayed_updates_never_shrink_a_table() {
+        let key = Address::from([1; 32]);
+        let (a, b) = (Address::from([8; 32]), Address::from([9; 32]));
+        let tables = DashMap::new();
+        apply_update(&tables, account_update(key, 1, &[a, b])).unwrap();
+        apply_update(&tables, account_update(key, 1, &[a])).unwrap();
+        assert_eq!(tables.get(&key).unwrap().addresses, vec![a, b]);
     }
 
     #[test]
     fn yellowstone_updates_upsert_and_remove_tables() {
         let key = Address::from([1; 32]);
         let tables = DashMap::new();
-        apply_update(&tables, account_update(key, 1)).unwrap();
+        apply_update(&tables, account_update(key, 1, &[Address::from([9; 32])])).unwrap();
         assert_eq!(
             tables.get(&key).unwrap().addresses,
             vec![Address::from([9; 32])]
         );
-        apply_update(&tables, account_update(key, 0)).unwrap();
+        apply_update(&tables, account_update(key, 0, &[Address::from([9; 32])])).unwrap();
         assert!(!tables.contains_key(&key));
     }
 }

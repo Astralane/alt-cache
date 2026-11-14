@@ -8,8 +8,9 @@ Rust library and in-memory service, version **4.2.2**. Live account updates use
 1. Open one Yellowstone stream per configured gRPC source, subscribing to ALT
    accounts and confirmed slot notifications.
 2. Fetch one full confirmed snapshot while buffering active-source updates.
-3. Stage account updates by slot and publish them only after that slot is
-   confirmed.
+3. Apply each account update as it arrives (the subscription is at confirmed
+   commitment, so it is already confirmed data), ignoring older versions, and
+   publish the state on each confirmed slot notification.
 4. Serve immutable confirmed snapshots over binary gRPC streaming and JSON-RPC.
 
 The bootstrap RPC is independent of the gRPC sources. It must be Helius or a
@@ -74,8 +75,10 @@ gRPC method. Each bounded protobuf chunk contains raw ALT public keys and
 account data from one immutable confirmed snapshot. The client decodes chunks
 directly into its process-local `Arc<DashMap<...>>` and verifies the slot and
 total account count before publishing the map. The Yellowstone stream is opened
-before the snapshot request and account and confirmed-slot updates are buffered
-during the fetch, so the snapshot-to-live handoff has no gap. Snapshot URLs are
+before the snapshot request and its updates are applied to the same map as they
+arrive, so the snapshot-to-live handoff has no gap. Lookup tables only grow until
+closed, so a shorter copy of a table is older: neither the snapshot nor a late or
+replayed update ever replaces a newer cached table. Snapshot URLs are
 tried in configuration order until one returns a valid complete stream.
 Yellowstone sources are also tried in configuration order and rotated after a
 failure. Recovery builds a fresh map and atomically replaces the active map.
@@ -112,11 +115,10 @@ let key: Address = "ALT_ADDRESS".parse()?;
 let table: Option<solana_message::AddressLookupTableAccount> = cache.get(&key)?;
 ```
 
-`AltCache::connect` returns only after the initial snapshot and buffered updates
-have been installed. `get` returns an error while the local Yellowstone feed is
-recovering, `None` for a missing table, or Solana's standard
-`AddressLookupTableAccount`. Dropping the last clone of `AltCache` stops its
-background task.
+`AltCache::connect` returns only after the initial snapshot has been installed.
+`get` returns an error while the local Yellowstone feed is recovering, `None`
+for a missing table, or Solana's standard `AddressLookupTableAccount`. Dropping
+the last clone of `AltCache` stops its background task.
 
 ## Snapshot gRPC
 
@@ -180,8 +182,15 @@ client is paging.
   remain best effort. Logs remain the source of truth. The gRPC base URL
   identifies its source in health, logs, and alerts. Failure details are logged,
   but authentication tokens and credential-bearing RPC URLs are not.
-- SIGTERM/SIGINT cancels the services and stops the process. Data is in memory
-  only; every restart performs recovery.
+- During bootstrap and background refresh, live updates are buffered until the
+  full fetch lands. Only the newest write per account is kept and confirmed
+  slots collapse to the highest one, so `stream_capacity` counts accounts
+  touched during the fetch. If the buffer fills, bootstrap logs, alerts, and
+  retries; it does not exit the process.
+- SIGTERM/SIGINT cancels the services and stops the process with exit status 0.
+  Data is in memory only; every restart performs recovery. The bundled systemd
+  unit uses `Restart=always`, so a stray SIGTERM also restarts it, while
+  `systemctl stop` still stops it.
 - A permanent service returning unexpectedly is unrecoverable and terminates
   the process with exit status 1 so the process supervisor can restart it.
 

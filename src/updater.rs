@@ -9,9 +9,9 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use solana_address_lookup_table_interface::program;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -34,33 +34,69 @@ enum StateEvent {
     ConfirmedSlot(u64),
 }
 
+// Events seen while a full fetch runs. Each write carries the full account, and replay ignores
+// older versions anyway, so only the newest write per account is kept; confirmed slots collapse to
+// the highest one. Capacity counts accounts touched, not events.
+#[derive(Default)]
+struct BufferedEvents {
+    accounts: HashMap<Key, StateEvent>,
+    confirmed_slot: Option<u64>,
+}
+
+impl BufferedEvents {
+    fn push(&mut self, event: StateEvent, capacity: usize) -> Result<()> {
+        let (key, version) = match &event {
+            StateEvent::ConfirmedSlot(slot) => {
+                self.confirmed_slot = self.confirmed_slot.max(Some(*slot));
+                return Ok(());
+            }
+            StateEvent::Account {
+                key,
+                slot,
+                write_version,
+                ..
+            } => (*key, (*slot, *write_version)),
+        };
+        match self.accounts.get(&key) {
+            Some(StateEvent::Account {
+                slot,
+                write_version,
+                ..
+            }) if (*slot, *write_version) >= version => {}
+            None => {
+                ensure!(self.accounts.len() < capacity, "update buffer full");
+                self.accounts.insert(key, event);
+            }
+            Some(_) => {
+                self.accounts.insert(key, event);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply(self, updater: &mut StateUpdater) {
+        for event in self.accounts.into_values() {
+            apply_state_event(event, updater);
+        }
+        if let Some(slot) = self.confirmed_slot {
+            updater.confirm(slot);
+        }
+    }
+}
+
 struct RefreshInProgress {
     fetch_task: JoinHandle<Result<FetchedAltState>>,
-    buffered_events: VecDeque<StateEvent>,
+    buffered_events: BufferedEvents,
 }
 
 impl RefreshInProgress {
-    fn start(
-        client: reqwest::Client,
-        rpc_url: String,
-        buffer_capacity: usize,
-        minimum_context_slot: u64,
-    ) -> Self {
+    fn start(client: reqwest::Client, rpc_url: String, minimum_context_slot: u64) -> Self {
         Self {
             fetch_task: tokio::spawn(async move {
                 fetch_full_alt_state(&client, &rpc_url, Some(minimum_context_slot)).await
             }),
-            buffered_events: VecDeque::with_capacity(buffer_capacity.min(4_096)),
+            buffered_events: BufferedEvents::default(),
         }
-    }
-
-    fn buffer(&mut self, event: StateEvent, capacity: usize) -> Result<()> {
-        ensure!(
-            self.buffered_events.len() < capacity,
-            "background refresh update buffer full"
-        );
-        self.buffered_events.push_back(event);
-        Ok(())
     }
 }
 
@@ -115,7 +151,7 @@ fn buffer_refresh_event(
     let Some(active_refresh) = refresh.as_mut() else {
         return;
     };
-    if let Err(error) = active_refresh.buffer(event, capacity) {
+    if let Err(error) = active_refresh.buffered_events.push(event, capacity) {
         tracing::warn!(%error, "background ALT state refresh aborted");
         refresh.take();
     }
@@ -228,19 +264,21 @@ impl UpdaterService {
     async fn bootstrap_alt_state(&mut self) -> Result<Option<StateUpdater>> {
         let yellowstone_url = self.yellowstone_urls[self.active_source].clone();
         tracing::info!(yellowstone_url, "starting ALT state bootstrap");
+        let started = Instant::now();
         let client = self.client.clone();
         let bootstrap_rpc_url = self.bootstrap_rpc_url.clone();
         let fetch_fut = fetch_full_alt_state(&client, &bootstrap_rpc_url, None);
         tokio::pin!(fetch_fut);
-        let mut buffered = VecDeque::with_capacity(self.config.stream_capacity.min(10_000));
+        let mut buffered = BufferedEvents::default();
         let fetch_result = loop {
             tokio::select! {
                 _ = self.stop.cancelled() => return Ok(None),
                 result = &mut fetch_fut => break result,
                 event = self.events.recv() => {
-                    match event.context("all Yellowstone sources stopped")? {
+                    let event = match event.context("all Yellowstone sources stopped")? {
                         Event::Connected { source } => {
                             self.connected_sources.insert(source);
+                            continue;
                         }
                         Event::Disconnected { source: failed } => {
                             self.connected_sources.remove(&failed);
@@ -248,29 +286,36 @@ impl UpdaterService {
                                 self.select_next_yellowstone();
                                 return Ok(None);
                             }
+                            continue;
                         }
-                        Event::Account { source, update } => {
-                            if source == self.active_source {
-                                ensure!(buffered.len() < self.config.stream_capacity, "bootstrap update buffer full");
-                                match decode_account_update(*update) {
-                                    Ok(event) => buffered.push_back(event),
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            error = %format!("{error:#}"),
-                                            "active Yellowstone update failed"
-                                        );
-                                        self.select_next_yellowstone();
-                                        return Ok(None);
-                                    }
+                        Event::Account { source, update } if source == self.active_source => {
+                            match decode_account_update(*update) {
+                                Ok(event) => event,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %format!("{error:#}"),
+                                        "active Yellowstone update failed"
+                                    );
+                                    self.select_next_yellowstone();
+                                    return Ok(None);
                                 }
                             }
                         }
-                        Event::ConfirmedSlot { source, slot } => {
-                            if source == self.active_source {
-                                ensure!(buffered.len() < self.config.stream_capacity, "bootstrap update buffer full");
-                                buffered.push_back(StateEvent::ConfirmedSlot(slot));
-                            }
+                        Event::ConfirmedSlot { source, slot } if source == self.active_source => {
+                            StateEvent::ConfirmedSlot(slot)
                         }
+                        Event::Account { .. } | Event::ConfirmedSlot { .. } => continue,
+                    };
+                    // A slow fetch must retry, not exit the process: the panic hook turns an error here into exit(1).
+                    if let Err(error) = buffered.push(event, self.config.stream_capacity) {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            elapsed = ?started.elapsed(),
+                            "ALT cache bootstrap outran its update buffer; retrying"
+                        );
+                        logging::alert("ALT cache bootstrap update buffer full; retrying. Raise stream_capacity if this repeats");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        return Ok(None);
                     }
                 }
             }
@@ -294,11 +339,9 @@ impl UpdaterService {
             fetched_alt_state,
         );
 
-        while let Some(event) = buffered.pop_front() {
-            apply_state_event(event, &mut updater);
-        }
+        buffered.apply(&mut updater);
         updater.finish_recovery();
-        tracing::info!(yellowstone_url, context_slot, "cache ready");
+        tracing::info!(yellowstone_url, context_slot, elapsed = ?started.elapsed(), "cache ready");
         Ok(Some(updater))
     }
 
@@ -330,7 +373,6 @@ impl UpdaterService {
                         refresh = Some(RefreshInProgress::start(
                             self.client.clone(),
                             self.bootstrap_rpc_url.clone(),
-                            self.config.stream_capacity,
                             updater.confirmed_slot(),
                         ));
                     }
@@ -418,10 +460,7 @@ impl UpdaterService {
             yellowstone_url.to_owned(),
             fetched_alt_state,
         );
-        let buffered_events = std::mem::take(&mut completed.buffered_events);
-        for event in buffered_events {
-            apply_state_event(event, &mut refreshed);
-        }
+        std::mem::take(&mut completed.buffered_events).apply(&mut refreshed);
         refreshed.finish_recovery();
         *updater = refreshed;
         tracing::info!(
@@ -478,6 +517,98 @@ fn decode_account_update(update: SubscribeUpdateAccount) -> Result<StateEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
+
+    fn account_event(key: u8, slot: u64, write_version: u64) -> StateEvent {
+        StateEvent::Account {
+            key: [key; 32],
+            slot,
+            write_version,
+            account: Some(Arc::new(Account {
+                value: SubscribeUpdateAccountInfo {
+                    pubkey: vec![key; 32],
+                    data: vec![key, slot as u8],
+                    ..Default::default()
+                },
+            })),
+        }
+    }
+
+    fn recovered(events: impl FnOnce(&mut StateUpdater)) -> (u64, Vec<(Key, Vec<u8>)>) {
+        let store = Arc::new(Store::new());
+        let mut updater = StateUpdater::from_fetched_alt_state(
+            store.clone(),
+            "test".into(),
+            FetchedAltState {
+                context_slot: 10,
+                accounts: BTreeMap::new(),
+            },
+        );
+        events(&mut updater);
+        updater.finish_recovery();
+        let snapshot = store.read_snapshot().unwrap();
+        let accounts = snapshot
+            .accounts
+            .iter()
+            .map(|(key, account)| (*key, account.value().data.clone()))
+            .collect();
+        (snapshot.slot, accounts)
+    }
+
+    #[test]
+    fn collapsed_confirmations_replay_to_the_same_state() {
+        let events = || {
+            vec![
+                account_event(1, 11, 1),
+                StateEvent::ConfirmedSlot(11),
+                // Arrives after its slot was confirmed.
+                account_event(2, 11, 1),
+                StateEvent::ConfirmedSlot(12),
+                account_event(1, 12, 2),
+                // Its slot is never confirmed, but the write is already confirmed-commitment data.
+                account_event(3, 14, 1),
+                StateEvent::ConfirmedSlot(13),
+                StateEvent::ConfirmedSlot(9),
+            ]
+        };
+        let sequential = recovered(|updater| {
+            for event in events() {
+                apply_state_event(event, updater);
+            }
+        });
+        let collapsed = recovered(|updater| {
+            let mut buffered = BufferedEvents::default();
+            for event in events() {
+                buffered.push(event, 16).unwrap();
+            }
+            buffered.apply(updater);
+        });
+
+        assert_eq!(collapsed, sequential);
+        assert_eq!(collapsed.0, 13);
+        assert_eq!(collapsed.1.len(), 3);
+    }
+
+    #[test]
+    fn only_distinct_accounts_use_buffer_capacity() {
+        let mut buffered = BufferedEvents::default();
+        for slot in 0..10_000 {
+            buffered.push(StateEvent::ConfirmedSlot(slot), 2).unwrap();
+        }
+        buffered.push(account_event(1, 11, 1), 2).unwrap();
+        buffered.push(account_event(2, 11, 1), 2).unwrap();
+        // More writes to accounts already held replace them, or are ignored if older.
+        buffered.push(account_event(1, 12, 1), 2).unwrap();
+        buffered.push(account_event(1, 11, 9), 2).unwrap();
+
+        assert!(buffered.push(account_event(3, 11, 1), 2).is_err());
+        assert_eq!(buffered.confirmed_slot, Some(9_999));
+        assert!(matches!(
+            buffered.accounts[&[1; 32]],
+            StateEvent::Account { slot: 12, .. }
+        ));
+    }
 
     #[test]
     fn next_connected_wraps_and_skips_disconnected_sources() {

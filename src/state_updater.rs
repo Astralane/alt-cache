@@ -16,14 +16,8 @@ pub(crate) struct StateUpdater {
     confirmed_slot: u64,
     active_yellowstone_url: String,
     accounts: OrdMap<Key, Arc<Account>>,
-    pending: BTreeMap<u64, Vec<Mutation>>,
     versions: HashMap<Key, (u64, u64)>,
     recovering: bool,
-}
-
-struct Mutation {
-    key: Key,
-    account: Option<Arc<Account>>,
 }
 
 impl StateUpdater {
@@ -34,7 +28,6 @@ impl StateUpdater {
             confirmed_slot: 0,
             active_yellowstone_url: String::new(),
             accounts: OrdMap::new(),
-            pending: BTreeMap::new(),
             versions: HashMap::new(),
             recovering: true,
         }
@@ -59,14 +52,12 @@ impl StateUpdater {
             confirmed_slot: fetched.context_slot,
             active_yellowstone_url,
             accounts: fetched.accounts.into_iter().collect(),
-            pending: BTreeMap::new(),
             versions: HashMap::new(),
             recovering: true,
         }
     }
 
     pub(crate) fn finish_recovery(&mut self) {
-        self.apply_pending_through(self.confirmed_slot);
         self.store.publish(
             &self.active_yellowstone_url,
             self.confirmed_slot,
@@ -75,6 +66,9 @@ impl StateUpdater {
         self.recovering = false;
     }
 
+    /// Applies a write unless an equal or newer version of the account is already applied. The
+    /// subscription is at confirmed commitment, so every write is already confirmed; readers see it
+    /// at the next published slot.
     pub(crate) fn queue(
         &mut self,
         key: Key,
@@ -91,10 +85,11 @@ impl StateUpdater {
             return false;
         }
         self.versions.insert(key, (slot, version));
-        self.pending
-            .entry(slot)
-            .or_default()
-            .push(Mutation { key, account });
+        if let Some(account) = account {
+            self.accounts.insert(key, account);
+        } else {
+            self.accounts.remove(&key);
+        }
         true
     }
 
@@ -102,26 +97,12 @@ impl StateUpdater {
         if slot <= self.confirmed_slot {
             return false;
         }
-        self.apply_pending_through(slot);
         self.confirmed_slot = slot;
         if !self.recovering {
             self.store
                 .publish(&self.active_yellowstone_url, slot, self.accounts.clone());
         }
         true
-    }
-
-    fn apply_pending_through(&mut self, slot: u64) {
-        let slots: Vec<_> = self.pending.range(..=slot).map(|(slot, _)| *slot).collect();
-        for slot in slots {
-            for mutation in self.pending.remove(&slot).unwrap() {
-                if let Some(account) = mutation.account {
-                    self.accounts.insert(mutation.key, account);
-                } else {
-                    self.accounts.remove(&mutation.key);
-                }
-            }
-        }
     }
 }
 
@@ -207,6 +188,19 @@ mod tests {
 
         assert!(store.health().ready);
         assert_eq!(store.health().confirmed_slot, 21);
+        assert_eq!(store.health().accounts, 1);
+    }
+
+    #[test]
+    fn a_write_is_published_without_waiting_for_its_own_slot() {
+        let (store, mut updater) = store();
+        let key = [8; 32];
+
+        // Confirmed-commitment data for slot 15 arrives before slot 15's confirmation.
+        assert!(updater.queue(key, 15, 1, Some(Arc::new(account(key)))));
+        assert!(updater.confirm(12));
+
+        assert_eq!(store.health().confirmed_slot, 12);
         assert_eq!(store.health().accounts, 1);
     }
 
