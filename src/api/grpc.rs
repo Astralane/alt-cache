@@ -7,7 +7,6 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use futures::Stream;
-use prost::Message;
 use std::{net::SocketAddr, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -37,27 +36,30 @@ impl AltSnapshot for SnapshotService {
         let (sender, receiver) = mpsc::channel(CHUNK_CHANNEL_CAPACITY);
         tokio::spawn(async move {
             let account_count = snapshot.accounts.len();
-            let mut chunk = SnapshotChunk {
+            let empty_chunk = || SnapshotChunk {
                 confirmed_slot: snapshot.slot,
                 total_accounts: account_count as u64,
                 accounts: Vec::new(),
             };
+            let mut chunk = empty_chunk();
+            // Tracked incrementally; re-encoding the whole chunk per account is quadratic.
+            let mut chunk_bytes = 0;
             for (key, account) in snapshot.accounts.iter() {
-                chunk.accounts.push(AltAccount {
+                let account = AltAccount {
                     pubkey: key.to_vec(),
                     data: account.value().data.clone(),
-                });
-                if chunk.encoded_len() >= TARGET_CHUNK_BYTES {
-                    match sender.send(Ok(chunk)).await {
-                        Ok(()) => {
-                            chunk = SnapshotChunk {
-                                confirmed_slot: snapshot.slot,
-                                total_accounts: account_count as u64,
-                                accounts: Vec::new(),
-                            };
-                        }
-                        Err(_) => return,
+                };
+                chunk_bytes += prost::encoding::message::encoded_len(3, &account);
+                chunk.accounts.push(account);
+                if chunk_bytes >= TARGET_CHUNK_BYTES {
+                    if sender
+                        .send(Ok(std::mem::replace(&mut chunk, empty_chunk())))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
+                    chunk_bytes = 0;
                 }
             }
             if !chunk.accounts.is_empty() || account_count == 0 {
